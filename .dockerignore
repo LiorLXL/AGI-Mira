@@ -35,5 +35,6 @@ Thumbs.db
 
 # 本地敏感配置
 config/config.local.yaml
+benchmark/.benchmark-token
 .env
 .env.*

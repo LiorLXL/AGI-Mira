@@ -18,9 +18,15 @@ class HistoryMessage:
 class LLMRewriter:
     """用 LLM 做 history-aware multi-query 改写，失败时回退原 query。"""
 
-    def __init__(self, generate_fn: Optional[GenerateFn], num_queries: int = 3):
+    def __init__(
+        self,
+        generate_fn: Optional[GenerateFn],
+        num_queries: int = 3,
+        strict: bool = False,
+    ):
         self.generate_fn = generate_fn
         self.num_queries = num_queries if num_queries > 0 else 3
+        self.strict = strict
 
     def rewrite(self, query: str, history: List[HistoryMessage]) -> List[str]:
         query = (query or "").strip()
@@ -44,13 +50,21 @@ class LLMRewriter:
             "- 不要编造历史中未出现的人名、机构、产品名等实体\n"
             "- 只输出 JSON 数组结构，禁止任何前后说明文字"
         )
+        raw = ""
         try:
             raw = self.generate_fn(system_prompt, user_msg)
             queries = _parse_queries(raw)
         except Exception as e:
+            if self.strict:
+                preview = (raw or "")[:500].replace("\n", "\\n")
+                raise RuntimeError(
+                    f"Query rewrite failed: {e}; raw_preview={preview!r}"
+                ) from e
             logger.warning("⚠️  Query rewrite 失败，回退原查询: %s", e)
             return [query]
         if not queries:
+            if self.strict:
+                raise RuntimeError("Query rewrite returned an empty queries array")
             return [query]
         return _dedup_keep_order(queries + [query])[:self.num_queries]
 

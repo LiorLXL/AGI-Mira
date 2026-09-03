@@ -37,6 +37,7 @@ Thumbs.db
 
 # 含密钥的本地配置
 config/config.local.yaml
+benchmark/.benchmark-token
 .env
 .env.*
 

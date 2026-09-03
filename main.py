@@ -20,6 +20,7 @@ os.environ.setdefault("FRONTEND_DIR", os.path.join(PROJECT_ROOT, "frontend"))
 from config.config import default_config  # noqa: E402
 from internal.agent.agent import UnifiedAgent  # noqa: E402
 from internal.handler.handler import setup_routes  # noqa: E402
+from internal.handler.benchmark import setup_benchmark_routes  # noqa: E402
 from internal.infra.infra import Infrastructure  # noqa: E402
 
 logging.basicConfig(
@@ -42,6 +43,7 @@ def build_deps():
     inf = Infrastructure(cfg)
     agent = UnifiedAgent(cfg, inf)
     app = setup_routes(agent, inf, cfg)
+    setup_benchmark_routes(app, cfg)
     return Deps(cfg=cfg, inf=inf, agent=agent, app=app)
 
 

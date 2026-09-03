@@ -153,12 +153,12 @@ services:
       neo4j:
         condition: service_started
     environment:
-      AGI_CONFIG: /app/config/config.yaml
+      AGI_CONFIG: /app/config/config.local.yaml
       FRONTEND_DIR: /app/frontend
     ports:
       - "8090:8090"
     volumes:
-      - ./config/config.yaml:/app/config/config.yaml:ro
+      - ./config/config.local.yaml:/app/config/config.local.yaml:ro
 
 volumes:
   postgres_data:

@@ -11,9 +11,15 @@ GenerateFn = Callable[[str, str], str]
 class LLMReranker:
     """用一次 LLM listwise 调用对候选 chunk 精排，失败时回退原顺序。"""
 
-    def __init__(self, generate_fn: Optional[GenerateFn], preview_len: int = 200):
+    def __init__(
+        self,
+        generate_fn: Optional[GenerateFn],
+        preview_len: int = 200,
+        strict: bool = False,
+    ):
         self.generate_fn = generate_fn
         self.preview_len = preview_len if preview_len > 0 else 200
+        self.strict = strict
 
     def rerank(self, query: str, results: List, top_k: int) -> List:
         if not results:
@@ -21,17 +27,29 @@ class LLMReranker:
         if self.generate_fn is None or len(results) == 1:
             return _truncate(results, top_k)
 
+        raw = ""
         try:
             raw = self.generate_fn(self._system_prompt(), self._user_msg(query, results))
             scores = _parse_scores(raw)
         except Exception as e:
+            if self.strict:
+                preview = (raw or "")[:500].replace("\n", "\\n")
+                raise RuntimeError(
+                    f"Rerank failed: {e}; raw_preview={preview!r}"
+                ) from e
             logger.warning("⚠️  Rerank 失败，回退 RRF 顺序: %s", e)
             return _truncate(results, top_k)
         if not scores:
+            if self.strict:
+                raise RuntimeError("Rerank returned an empty scores array")
             return _truncate(results, top_k)
 
         score_map = {idx: score for idx, score in scores if 0 <= idx < len(results)}
         if len(score_map) != len(results):
+            if self.strict:
+                raise RuntimeError(
+                    f"Rerank scores count={len(score_map)}, expected={len(results)}"
+                )
             logger.warning(
                 "⚠️  Rerank scores 数量(%d) != 候选数量(%d)，缺失项补 0、越界项截断",
                 len(score_map), len(results),
@@ -71,7 +89,14 @@ class LLMReranker:
         )
 
     def _user_msg(self, query: str, results: List) -> str:
-        lines = [f"用户问题：{query}", "", "候选段落："]
+        count = len(results)
+        lines = [
+            f"用户问题：{query}",
+            f"候选总数：{count}",
+            f"必须返回 {count} 个评分，idx 必须完整覆盖 0 到 {count - 1}，不得遗漏。",
+            "",
+            "候选段落：",
+        ]
         for idx, result in enumerate(results):
             content = _result_content(result)
             if len(content) > self.preview_len:
