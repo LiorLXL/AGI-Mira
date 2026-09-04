@@ -36,7 +36,12 @@ class SlotFilter:
     min_score: float = 0.0    # 召回综合分阈值
     top_k: int = 0            # 单槽位最多返回项数（0 表示不截断）
     max_age_hours: int = 0    # 最大年龄（小时），0 表示不限
-    token_budget: int = 0     # 单槽位字符预算（粗略以字符数近似 token）
+    char_budget: int = 0      # 单槽位字符预算
+    token_budget: int = 0     # 兼容旧调用；新代码使用 char_budget
+
+    def effective_char_budget(self) -> int:
+        """Return the configured character budget without calling it tokens."""
+        return self.char_budget if self.char_budget > 0 else self.token_budget
 
 
 @dataclass

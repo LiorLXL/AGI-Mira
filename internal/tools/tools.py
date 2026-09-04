@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
+from internal.promptctx.prompts import SEARCH_ASSISTANT_SYSTEM_PROMPT
+
 logger = logging.getLogger(__name__)
 
 
@@ -116,7 +118,7 @@ def search_web_factory(cfg=None, llm=None) -> Callable[[Dict[str, Any]], str]:
 
                 resp = llm.chat(
                     [Message(role="user", content=f"请用简洁中文回答：{query}")],
-                    system_prompt="你是搜索助手，基于已知知识简明回答用户问题。",
+                    system_prompt=SEARCH_ASSISTANT_SYSTEM_PROMPT,
                 )
                 if resp:
                     return resp

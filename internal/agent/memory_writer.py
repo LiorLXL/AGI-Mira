@@ -19,6 +19,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from internal.llm.llm import Message
+from internal.promptctx.prompts import (
+    MEMORY_CLASSIFY_SYSTEM_PROMPT,
+    MEMORY_REPLY_EXTRACT_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -214,15 +218,12 @@ def extract_memory_from_reply(agent, answer: str):
     if not answer or not agent.cfg.is_real_llm():
         return
 
-    prompt = (
-        "从下面这段AI回复中，提取值得长期记住的客观事实或用户偏好信息。\n"
-        "只提取明确的、非临时性的信息，忽略对话上下文和临时细节。\n"
-        "输出 JSON 对象（key为中文名称，value为具体值），如果没有值得记忆的信息则输出 {}。\n"
-        "只输出 JSON，不要有其他内容。\n\n"
-        f"回复：{answer}"
-    )
+    prompt = f"回复：{answer}"
     try:
-        raw = agent.llm.chat([Message(role="user", content=prompt)], system_prompt="")
+        raw = agent.llm.chat(
+            [Message(role="user", content=prompt)],
+            system_prompt=MEMORY_REPLY_EXTRACT_SYSTEM_PROMPT,
+        )
     except Exception as e:
         logger.warning("⚠️  记忆抽取 LLM 调用失败: %s", e)
         return
@@ -345,14 +346,12 @@ def llm_classify_memory(agent, content: str) -> Tuple[str, List[str], str]:
     if not agent.cfg.is_real_llm():
         return "general", [], ""
 
-    prompt = (
-        "请对以下记忆内容进行分类，只输出 JSON，格式如下：\n"
-        '{"category":"identity|preference|fact|episodic|tool_failure|policy|general",'
-        '"tags":["tag1"],"slot_hint":"profile|planner|task_memory|tool_state|constraints|recall_memory"}\n'
-        f"\n记忆内容：{content}"
-    )
+    prompt = f"记忆内容：{content}"
     try:
-        raw = agent.llm.chat([Message(role="user", content=prompt)], system_prompt="")
+        raw = agent.llm.chat(
+            [Message(role="user", content=prompt)],
+            system_prompt=MEMORY_CLASSIFY_SYSTEM_PROMPT,
+        )
     except Exception:
         return "general", [], ""
     raw = _strip_code_fence(raw)

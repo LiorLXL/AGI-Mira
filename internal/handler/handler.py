@@ -77,6 +77,8 @@ def _response_to_dict(resp: Response) -> Dict[str, Any]:
         "long_term_count": resp.long_term_count,
         "preferences": resp.preferences,
         "interrupted": resp.interrupted,
+        "context_trace": resp.context_trace,
+        "prompt_trace": resp.prompt_trace,
         "success": True,
     }
 

@@ -93,7 +93,7 @@ class Preference:
         snap = self.snapshot()
         if not snap:
             return ""
-        lines = [f"{k}: {v}" for k, v in snap.items()]
+        lines = [f"{k}: {snap[k]}" for k in sorted(snap)]
         return "【用户偏好】\n" + "\n".join(lines)
 
 

@@ -83,7 +83,7 @@ def _required_params(tool: object) -> List[str]:
                 name = getattr(p, "name", "") or ""
                 if name:
                     required.append(name)
-    return required
+    return sorted(required)
 
 
 class ToolStateSource(ContextSource):

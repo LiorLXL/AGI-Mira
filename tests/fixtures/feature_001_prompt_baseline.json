@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "trace_contract": [
+    "mode",
+    "phase",
+    "prompt_version",
+    "stable_prefix_hash",
+    "prompt_chars",
+    "slots"
+  ],
+  "calls": {
+    "chat.generate": {
+      "system_prompt": "用户偏好: {\"语言\":\"中文\"}\n\n你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请介绍这个项目"
+        }
+      ]
+    },
+    "tool.generate": {
+      "system_prompt": "相关记忆:\n- 用户偏好中文回答\n\n你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "用户问：天气 上海\n工具 get_weather 返回结果：上海：晴，25℃\n请根据结果自然地回答用户。"
+        }
+      ]
+    },
+    "react.plan": {
+      "system_prompt": "用户偏好: {\"城市\":\"上海\"}\n\n你是一个精准的任务规划器，只在必要时才调用工具。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你是一个任务规划器。根据用户问题，从可用工具中选出需要调用的工具，并标注依赖关系。\n- 给每个工具调用分配唯一 id，如 n1、n2。\n- 如果工具 B 需要工具 A 的输出，则 B 的 depends_on 包含 A 的 id。\n- 如果两个工具功能类似，可设置相同 race_group，系统会并行竞速。\n用户问题：先查天气再搜索\n可用工具：\n- search_web: 搜索网页 [参数: query(string)（必填）]\n- get_weather: 查询天气 [参数: city(string)（必填）]\n请只输出 JSON 数组：[{\"id\":\"n1\",\"tool\":\"工具名\",\"params\":{},\"reason\":\"原因\",\"depends_on\":[],\"race_group\":\"\"}]。无需工具则输出 []。"
+        }
+      ]
+    },
+    "react.generate": {
+      "system_prompt": "你是一个总结助手，能够基于推理过程给出简洁的最终答案。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "基于以下推理过程，给出最终答案。\n\n任务: 汇总结果\n\n记忆上下文:\n相关记忆:\n- 用户偏好中文回答\n\n推理过程:\nObservation: 天气晴朗\n\n请用自然语言总结最终答案，不要包含 Action/Final 等关键字。\n"
+        }
+      ]
+    },
+    "rag.rewrite": {
+      "system_prompt": "你是检索系统的查询改写助手。给定用户当前问题和最近对话历史，你需要：\n1) 先把当前问题改写成一句**自包含的独立查询**（消除指代、补全省略，只用 query 本身就能让人看懂）。\n2) 再生成若干条**等价但措辞不同**的查询变体（同义词替换、抽象/具体切换、不同语序）。\n\n输出**严格 JSON**，不要任何说明文字、不要 markdown 代码块：\n{\"queries\": [\"独立查询\", \"变体1\", \"变体2\"]}\n\n约束：\n- 总条数严格等于 2\n- 每条不超过 50 字\n- 第一条必须可独立检索（不依赖历史）\n- 不要编造历史中未出现的人名、机构、产品名等实体\n- 只输出 JSON 数组结构，禁止任何前后说明文字",
+      "messages": [
+        {
+          "role": "user",
+          "content": "最近对话历史：\n[user] 上一轮问了 Agent\n\n当前问题：它如何工作？"
+        }
+      ]
+    },
+    "rag.generate": {
+      "system_prompt": "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，不要编造信息。如果上下文不足以回答，请说明。",
+      "messages": [
+        {
+          "role": "user",
+          "content": "上下文：\nTaskGraph 使用拓扑排序。\n\n问题：TaskGraph 如何执行？"
+        }
+      ]
+    }
+  },
+  "context_render": "【用户画像】\n- 城市: 上海\n- 语言: 中文\n\n【相关回忆】\n- 用户偏好简洁回答（重要性=0.80, 综合分=0.90）",
+  "current_runtime_context_trace": []
+}

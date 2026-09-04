@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Callable, Optional
 
+from internal.promptctx.prompts import GRAPH_EXTRACT_SYSTEM_PROMPT
+
 from .types import (
     Entity,
     ExtractResult,
@@ -23,33 +25,7 @@ logger = logging.getLogger(__name__)
 LLMFn = Callable[[str, str], str]
 
 
-EXTRACT_SYSTEM_PROMPT = """你是一个信息抽取专家。从给定文本中抽取命名实体和实体间关系。
-
-实体类型（type 字段只能用以下值）：
-- Person（人物）
-- Organization（组织/公司/机构）
-- Location（地点/地区）
-- Concept（概念/技术/思想）
-- Event（事件）
-- Product（产品/工具）
-- Unknown（其他）
-
-关系类型（rel_type 字段只能用以下值）：
-- RELATES_TO（相关）
-- PART_OF（属于/是...的一部分）
-- CAUSES（导致/引发）
-- DESCRIBES（描述/介绍）
-- MENTIONS（提及）
-- WORKS_FOR（工作于）
-- LOCATED_IN（位于）
-
-输出格式（只输出 JSON，不加任何说明）：
-{
-  "entities": [{"name":"实体名","type":"类型"}],
-  "relations": [{"from":"实体A","to":"实体B","rel_type":"关系类型"}]
-}
-
-如果文本中没有可抽取的实体，输出 {"entities":[],"relations":[]}"""
+EXTRACT_SYSTEM_PROMPT = GRAPH_EXTRACT_SYSTEM_PROMPT
 
 
 _VALID_ENTITY_TYPES = {

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from .schema import RuntimeContextSchema
 from .slot import (
@@ -23,7 +23,7 @@ class RuntimeContext:
 
     schema: RuntimeContextSchema
     filled: List[FilledSlot] = field(default_factory=list)
-    trace: List[str] = field(default_factory=list)  # debug：装配过程中的决策记录
+    trace: List[Dict[str, Any]] = field(default_factory=list)
 
     def slot_by_kind(self, kind: SlotKind) -> Optional[FilledSlot]:
         """取出特定槽位（不存在返回 None）。"""

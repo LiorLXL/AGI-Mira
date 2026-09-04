@@ -11,6 +11,12 @@ from typing import Any, Dict, List
 
 from internal.graph.task_graph import Node, NodeType
 from internal.llm.llm import Message
+from internal.promptctx.prompts import (
+    REACT_PLAN_SYSTEM_PROMPT,
+    REACT_STEPS_PLAN_SYSTEM_PROMPT,
+    compose_system_prompt,
+    render_tool_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,29 +37,12 @@ def llm_plan_steps(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     if not agent.cfg.is_real_llm():
         return rule_plan_items(agent, query, tools_map)
 
-    # 构造工具描述
-    tool_lines: List[str] = []
-    for name, t in tools_map.items():
-        p_descs: List[str] = []
-        for p in getattr(t, "params", []) or []:
-            req = "（必填）" if p.get("required") else ""
-            p_descs.append(f"{p.get('name','')}({p.get('type','string')}){req}")
-        params = ", ".join(p_descs) if p_descs else "无"
-        tool_lines.append(f"- {name}: {t.description} [参数: {params}]")
-
-    plan_prompt = (
-        "你是一个任务规划器。\n"
-        "根据用户问题，从可用工具中选出真正需要调用的工具（不要为了用工具而用工具，按需选择）。\n"
-        f"用户问题：{query}\n"
-        f"可用工具：\n{chr(10).join(tool_lines)}\n"
-        "请以 JSON 数组格式输出执行计划，格式如下：\n"
-        '[{"tool":"工具名","params":{"参数名":"参数值"},"reason":"一句话说明为什么调用这个工具"}]\n'
-        "如果无需工具直接回答，输出 []。只输出 JSON，不要其他内容。"
+    planner_base = compose_system_prompt(
+        REACT_STEPS_PLAN_SYSTEM_PROMPT,
+        mem_prefix,
+        render_tool_catalog(tools_map),
     )
-
-    planner_base = "你是一个精准的任务规划器，只在必要时才调用工具，不做无意义的调用。"
-    if mem_prefix:
-        planner_base = mem_prefix + "\n\n" + planner_base + "\n注意：用户偏好可能影响工具参数选择（如城市、时区等），请在参数中体现。"
+    plan_prompt = f"用户问题：{query}"
 
     try:
         raw = agent.llm.chat(
@@ -115,28 +104,12 @@ def llm_plan_graph(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     if not agent.cfg.is_real_llm():
         return rule_plan_nodes(agent, query, tools_map)
 
-    tool_lines: List[str] = []
-    for name, t in tools_map.items():
-        p_descs: List[str] = []
-        for p in getattr(t, "params", []) or []:
-            req = "（必填）" if p.get("required") else ""
-            p_descs.append(f"{p.get('name','')}({p.get('type','string')}){req}")
-        params = ", ".join(p_descs) if p_descs else "无"
-        tool_lines.append(f"- {name}: {getattr(t, 'description', '')} [参数: {params}]")
-
-    plan_prompt = (
-        "你是一个任务规划器。根据用户问题，从可用工具中选出需要调用的工具，并标注依赖关系。\n"
-        "- 给每个工具调用分配唯一 id，如 n1、n2。\n"
-        "- 如果工具 B 需要工具 A 的输出，则 B 的 depends_on 包含 A 的 id。\n"
-        "- 如果两个工具功能类似，可设置相同 race_group，系统会并行竞速。\n"
-        f"用户问题：{query}\n"
-        f"可用工具：\n{chr(10).join(tool_lines)}\n"
-        '请只输出 JSON 数组：[{"id":"n1","tool":"工具名","params":{},'
-        '"reason":"原因","depends_on":[],"race_group":""}]。无需工具则输出 []。'
+    planner_base = compose_system_prompt(
+        REACT_PLAN_SYSTEM_PROMPT,
+        mem_prefix,
+        render_tool_catalog(tools_map),
     )
-    planner_base = "你是一个精准的任务规划器，只在必要时才调用工具。"
-    if mem_prefix:
-        planner_base = mem_prefix + "\n\n" + planner_base
+    plan_prompt = f"用户问题：{query}"
     try:
         raw = agent.llm.chat([Message(role="user", content=plan_prompt)], system_prompt=planner_base)
         data = json.loads(_clean_json(raw))

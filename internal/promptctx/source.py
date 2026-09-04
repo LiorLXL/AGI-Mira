@@ -16,6 +16,8 @@ class Query:
     embedding: List[float] = field(default_factory=list)  # 已计算的 query embedding（可为空）
     task_id: str = ""                               # 当前任务 ID（用于 Task Memory）
     mode: str = ""                                  # chat / tool / react / rag
+    phase: str = ""                                 # generate / plan 等调用阶段
+    session_id: str = ""                            # 当前会话 ID（后续会话隔离使用）
 
 
 class ContextSource(ABC):
@@ -34,7 +36,8 @@ class ContextSource(ABC):
 
     @abstractmethod
     def fetch(self, slot: Slot, q: Query) -> List[ContextItem]:
-        """在不超过 slot.filter.token_budget 的前提下，返回适合该槽位的 ContextItem。
+        """返回适合该槽位的候选 ContextItem。
 
-        实现需自己做 TopK 截断与 budget 裁剪。失败时降级返回空列表，不抛异常。
+        TopK 与字符预算由 ContextAssembler 统一执行；Source 可做查询下推优化。
+        失败可抛异常，由 Assembler 记录 trace 并继续其他 Source。
         """

@@ -1,15 +1,21 @@
 # llm — LLM 客户端（OpenAI 兼容 Chat Completions + Embedding，与 main 分支 Go 版协议对齐）
+import hashlib
 import json
 import logging
 import re
 import threading
 import time
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from dataclasses import asdict, dataclass
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 from config.config import APIConfig
+from internal.promptctx.prompts import (
+    PREFERENCE_EXTRACT_SYSTEM_PROMPT,
+    prompt_identity,
+    stable_prompt_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +24,23 @@ logger = logging.getLogger(__name__)
 class Message:
     role: str
     content: str
+
+
+@dataclass
+class PromptCallTrace:
+    sequence: int
+    purpose: str
+    prompt_version: str
+    stable_prefix_hash: str
+    stable_prefix_chars: int
+    prompt_chars: int
+    common_prefix_chars: int
+    stream: bool
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    cached_input_tokens: Optional[int] = None
+    fallback: bool = False
+    error_type: str = ""
 
 
 class Client:
@@ -30,16 +53,22 @@ class Client:
             "你是谁": "我是一个全能 AI 助手，具备知识库、工具调用、推理、记忆和稳定执行能力。",
             "后端工程师": "后端工程师负责服务器端逻辑开发：API 设计、数据库、业务逻辑、系统架构、性能优化。",
         }
+        self._trace_lock = threading.RLock()
+        self._trace_sequence = 0
+        self._prompt_traces: List[PromptCallTrace] = []
+        self._previous_prompt: Dict[str, str] = {}
 
     # ── Chat ────────────────────────────────────────────────────────────────
 
     def chat(self, messages: List[Message], system_prompt: str = "") -> str:
         """OpenAI 兼容 /chat/completions 调用。"""
+        trace = self._begin_prompt_trace(system_prompt, messages, stream=False)
         if not self.cfg.is_real_llm():
             return self._mock(messages)
         try:
-            return self._call_chat(system_prompt, messages)
+            return self._call_chat(system_prompt, messages, trace=trace)
         except Exception as e:
+            self._mark_trace_error(trace, e, fallback=True)
             logger.error("LLM API 调用失败: %s，回退到 Mock", e)
             return self._mock(messages)
 
@@ -64,6 +93,7 @@ class Client:
         - 异常时已发出的 token 不会回滚；返回累积的 full_text（失败回退到同步 chat）。
         """
         is_cancelled = getattr(ctx, "is_cancelled", None)
+        trace = self._begin_prompt_trace(system_prompt, messages, stream=True)
 
         def _cancelled() -> bool:
             try:
@@ -87,11 +117,15 @@ class Client:
             return reply
 
         try:
-            return self._call_chat_stream(ctx, system_prompt, messages, on_token)
+            return self._call_chat_stream(
+                ctx, system_prompt, messages, on_token, trace=trace
+            )
         except Exception as e:
             if _cancelled():
+                self._mark_trace_error(trace, e)
                 return "[已中断]"
             logger.warning("LLM 流式调用失败: %s，回退到同步", e)
+            self._mark_trace_error(trace, e, fallback=True)
             try:
                 return self._call_chat(system_prompt, messages)
             except Exception as e2:
@@ -104,7 +138,10 @@ class Client:
         system_prompt: str,
         messages: List[Message],
         on_token: Optional[Callable[[str], None]],
+        trace: Optional[PromptCallTrace] = None,
     ) -> str:
+        if trace is None:
+            trace = self._begin_prompt_trace(system_prompt, messages, stream=True)
         msgs: List[Dict[str, str]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -162,6 +199,9 @@ class Client:
                     err = chunk["error"]
                     msg = err.get("message") if isinstance(err, dict) else str(err)
                     raise RuntimeError(f"API 流式错误: {msg}")
+                self._apply_usage(
+                    trace, chunk.get("usage") if isinstance(chunk, dict) else None
+                )
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue
@@ -228,7 +268,14 @@ class Client:
         t.start()
         return lambda: stop_evt.set()
 
-    def _call_chat(self, system_prompt: str, messages: List[Message]) -> str:
+    def _call_chat(
+        self,
+        system_prompt: str,
+        messages: List[Message],
+        trace: Optional[PromptCallTrace] = None,
+    ) -> str:
+        if trace is None:
+            trace = self._begin_prompt_trace(system_prompt, messages, stream=False)
         msgs: List[Dict[str, str]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -247,6 +294,7 @@ class Client:
         if resp.status_code != 200:
             raise RuntimeError(f"API 返回错误状态 {resp.status_code}, body: {resp.text}")
         data = resp.json()
+        self._apply_usage(trace, data.get("usage"))
         if data.get("error"):
             raise RuntimeError(f"API 错误: {data['error'].get('message')}")
         choices = data.get("choices") or []
@@ -305,14 +353,12 @@ class Client:
         if not self.cfg.is_real_llm():
             return _extract_rule_based(msg)
 
-        prompt = (
-            "从下面这句用户消息中，提取所有用户的个人信息和偏好，"
-            "输出 JSON 对象（key 为中文名称，value 为具体值）。"
-            "如果没有任何偏好信息，输出 {}。只输出 JSON，不要有其他内容。\n\n"
-            f"消息：{msg}"
-        )
+        prompt = f"消息：{msg}"
         try:
-            raw = self._call_chat("", [Message(role="user", content=prompt)])
+            raw = self._call_chat(
+                PREFERENCE_EXTRACT_SYSTEM_PROMPT,
+                [Message(role="user", content=prompt)],
+            )
         except Exception:
             return _extract_rule_based(msg)
 
@@ -329,6 +375,98 @@ class Client:
         except Exception:
             pass
         return _extract_rule_based(msg)
+
+    # ── Prompt/cache telemetry ────────────────────────────────────────────
+
+    def prompt_trace_count(self) -> int:
+        with self._trace_lock:
+            return self._trace_sequence
+
+    def prompt_traces_since(self, sequence: int) -> List[Dict[str, Any]]:
+        with self._trace_lock:
+            return [
+                asdict(trace)
+                for trace in self._prompt_traces
+                if trace.sequence > int(sequence or 0)
+            ]
+
+    def prompt_traces(self) -> List[Dict[str, Any]]:
+        return self.prompt_traces_since(0)
+
+    def _begin_prompt_trace(
+        self,
+        system_prompt: str,
+        messages: List[Message],
+        *,
+        stream: bool,
+    ) -> PromptCallTrace:
+        purpose, version = prompt_identity(system_prompt)
+        stable_prefix = stable_prompt_prefix(system_prompt)
+        wire_messages: List[Dict[str, str]] = []
+        if system_prompt:
+            wire_messages.append({"role": "system", "content": system_prompt})
+        wire_messages.extend(
+            {"role": message.role, "content": message.content}
+            for message in messages
+        )
+        serialized = json.dumps(
+            wire_messages,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        scope = f"{purpose}@{version}"
+        with self._trace_lock:
+            previous = self._previous_prompt.get(scope, "")
+            common = _common_prefix_length(previous, serialized) if previous else 0
+            self._previous_prompt[scope] = serialized
+            self._trace_sequence += 1
+            trace = PromptCallTrace(
+                sequence=self._trace_sequence,
+                purpose=purpose,
+                prompt_version=version,
+                stable_prefix_hash=hashlib.sha256(
+                    stable_prefix.encode("utf-8")
+                ).hexdigest()[:16],
+                stable_prefix_chars=len(stable_prefix),
+                prompt_chars=len(serialized),
+                common_prefix_chars=common,
+                stream=stream,
+            )
+            self._prompt_traces.append(trace)
+            if len(self._prompt_traces) > 200:
+                self._prompt_traces = self._prompt_traces[-200:]
+            return trace
+
+    def _apply_usage(
+        self, trace: Optional[PromptCallTrace], usage: Optional[Dict[str, Any]]
+    ) -> None:
+        if trace is None or not isinstance(usage, dict):
+            return
+        details = usage.get("prompt_tokens_details") or {}
+        cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        if cached is None:
+            cached = usage.get("cached_input_tokens", usage.get("cached_tokens"))
+        with self._trace_lock:
+            trace.input_tokens = _optional_int(
+                usage.get("prompt_tokens", usage.get("input_tokens"))
+            )
+            trace.output_tokens = _optional_int(
+                usage.get("completion_tokens", usage.get("output_tokens"))
+            )
+            trace.cached_input_tokens = _optional_int(cached)
+
+    def _mark_trace_error(
+        self,
+        trace: Optional[PromptCallTrace],
+        error: Exception,
+        *,
+        fallback: bool = False,
+    ) -> None:
+        if trace is None:
+            return
+        with self._trace_lock:
+            trace.error_type = type(error).__name__
+            trace.fallback = fallback
 
     # ── Mock ────────────────────────────────────────────────────────────────
 
@@ -367,3 +505,20 @@ def _safe_close(session: "requests.Session") -> None:
         session.close()
     except Exception:
         pass
+
+
+def _common_prefix_length(a: str, b: str) -> int:
+    limit = min(len(a), len(b))
+    index = 0
+    while index < limit and a[index] == b[index]:
+        index += 1
+    return index
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

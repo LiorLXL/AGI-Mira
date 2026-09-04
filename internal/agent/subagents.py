@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 from internal.document.library import DOCUMENT_SOURCE_AGENT, WriteRequest
+from internal.promptctx.prompts import (
+    REVIEW_AGENT_SYSTEM_PROMPT,
+    WRITER_AGENT_SYSTEM_PROMPT,
+)
 
 
 @dataclass
@@ -91,7 +95,7 @@ class WriterAgent:
         if not _is_real_llm(self.agent):
             return "# " + _safe_title(task.goal, task.query) + "\n\n" + material
         return self.agent._llm_generate(
-            "你是 writer_agent。请把输入整理为清晰 Markdown 报告，包含摘要、分析、建议和下一步。",
+            WRITER_AGENT_SYSTEM_PROMPT,
             f"写作目标：{task.goal}\n\n材料：\n{material}",
         )
 
@@ -111,7 +115,7 @@ class ReviewAgent:
         if not _is_real_llm(self.agent):
             return "Review: 内容已整理；建议人工确认关键事实。"
         return self.agent._llm_generate(
-            "你是 review_agent。请审查输入，输出问题清单、可信度和需要补证据的点。",
+            REVIEW_AGENT_SYSTEM_PROMPT,
             material,
         )
 

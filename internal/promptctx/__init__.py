@@ -9,9 +9,13 @@ from .assembler import ContextAssembler, SourceRegistry
 from .context import RuntimeContext
 from .schema import (
     CHAT_SCHEMA,
+    DEFAULT_GLOBAL_CHAR_BUDGET,
     DEFAULT_GLOBAL_TOKEN_BUDGET,
     RAG_SCHEMA,
+    RAG_GENERATE_SCHEMA,
     REACT_SCHEMA,
+    REACT_GENERATE_SCHEMA,
+    REACT_PLAN_SCHEMA,
     RuntimeContextSchema,
     TOOL_SCHEMA,
     default_schemas,
@@ -46,6 +50,14 @@ from .source_tools import (
     ToolStateSource,
     ToolStateTracker,
 )
+from .prompts import (
+    PROMPT_VERSION,
+    RUNTIME_CONTEXT_MARKER,
+    compose_system_prompt,
+    prompt_identity,
+    render_tool_catalog,
+    stable_prompt_prefix,
+)
 
 __all__ = [
     # assembler / context
@@ -59,8 +71,12 @@ __all__ = [
     "REACT_SCHEMA",
     "RAG_SCHEMA",
     "DEFAULT_GLOBAL_TOKEN_BUDGET",
+    "DEFAULT_GLOBAL_CHAR_BUDGET",
     "default_schemas",
     "slot_priority",
+    "REACT_PLAN_SCHEMA",
+    "REACT_GENERATE_SCHEMA",
+    "RAG_GENERATE_SCHEMA",
     # slot
     "Slot",
     "SlotFilter",
@@ -93,6 +109,13 @@ __all__ = [
     "ToolStateTracker",
     "ToolCallTrace",
     "ToolRegistryProvider",
+    # versioned fixed prompts / cache helpers
+    "PROMPT_VERSION",
+    "RUNTIME_CONTEXT_MARKER",
+    "compose_system_prompt",
+    "prompt_identity",
+    "render_tool_catalog",
+    "stable_prompt_prefix",
     # planner
     "PlannerSource",
     "PlannerSnapshot",

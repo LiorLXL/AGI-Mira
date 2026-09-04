@@ -44,6 +44,13 @@ from internal.promptctx import (
     ToolStateTracker,
     default_schemas,
 )
+from internal.promptctx.prompts import (
+    CHAT_SYSTEM_PROMPT,
+    PROMPT_VERSION,
+    REACT_FINAL_SYSTEM_PROMPT,
+    TOOL_RESULT_SYSTEM_PROMPT,
+    compose_system_prompt,
+)
 from internal.rag.rag import Engine as RAGEngine
 from internal.rag.reranker import LLMReranker
 from internal.rag.rewriter import HistoryMessage, LLMRewriter
@@ -103,6 +110,8 @@ class Response:
     long_term_count: int = 0
     preferences: Dict[str, str] = field(default_factory=dict)
     interrupted: bool = False
+    context_trace: List[dict] = field(default_factory=list)
+    prompt_trace: List[dict] = field(default_factory=list)
 
 
 class UnifiedAgent:
@@ -434,6 +443,7 @@ class UnifiedAgent:
 
     def _dispatch(self, query: str, opts: ChatOptions, token, on_event=None) -> Response:
         """三段式编排：prepare → dispatch → finalize（与 main runOnce 对齐）。"""
+        prompt_trace_start = _prompt_trace_count(self.llm)
         pr = self._prepare(query, opts)
         resp = Response(query=query, mode=pr["mode"])
         resp.extracted_info = pr["extracted"]
@@ -448,6 +458,8 @@ class UnifiedAgent:
             return resp
 
         self._dispatch_mode(pr, resp, token, on_event)
+        resp.context_trace = list(pr["context_trace"])
+        resp.prompt_trace = _prompt_traces_since(self.llm, prompt_trace_start)
 
         if token.is_cancelled():
             resp.interrupted = True
@@ -459,7 +471,7 @@ class UnifiedAgent:
     # ── prepare ──────────────────────────────────────────────────────────────
 
     def _prepare(self, query: str, opts: ChatOptions) -> Dict[str, Any]:
-        """STM 写入 + 偏好提取 + 路由决策 + 上下文装配 + 历史构建。"""
+        """STM 写入 + 偏好提取 + 路由决策 + history/embedding 准备。"""
         self.stm.add("user", query)
         self._save_chat_history("user", query)
 
@@ -488,15 +500,21 @@ class UnifiedAgent:
             else:
                 mode, route_tools = "chat", None
 
-        mem_prefix = self._build_memory_system_prefix(query)
         hist_msgs = self._build_history_messages(query)
+        # Production phase schemas only use semantic Memory recall in chat.
+        # RAG owns its (possibly multi-query) embeddings, so avoid an extra
+        # context-only embedding call for tool/react/rag routes.
+        query_embedding = (
+            self._compute_query_embedding(query) if mode == "chat" else []
+        )
 
         return {
             "query": query,
             "mode": mode,
             "route_tools": route_tools,
-            "mem_prefix": mem_prefix,
             "hist_msgs": hist_msgs,
+            "query_embedding": query_embedding,
+            "context_trace": [],
             "extracted": ph.extracted_info,
         }
 
@@ -506,25 +524,59 @@ class UnifiedAgent:
         """按 mode 分发到对应 handler，把结果填回 resp。"""
         mode = pr["mode"]
         query = pr["query"]
-        mem_prefix = pr["mem_prefix"]
         hist_msgs = pr["hist_msgs"]
+        query_embedding = pr["query_embedding"]
         route_tools = pr["route_tools"]
         resp.extracted_info = pr["extracted"]
 
         if mode == "react":
             resp.answer, resp.steps, resp.task = self._run_react_with_tools(
-                query, route_tools, mem_prefix, hist_msgs, token, on_event
+                query,
+                route_tools,
+                hist_msgs,
+                query_embedding,
+                token,
+                on_event,
+                pr["context_trace"],
             )
         elif mode == "tool":
+            context_prefix = self._request_context_prefix(
+                query,
+                mode="tool",
+                phase="generate",
+                query_embedding=query_embedding,
+                trace_sink=pr["context_trace"],
+                on_event=on_event,
+            )
             resp.answer, resp.tool_call = self._run_tool_from_set(
-                query, route_tools, mem_prefix, hist_msgs, token, on_event
+                query, route_tools, context_prefix, hist_msgs, token, on_event
             )
         elif mode == "rag":
-            resp.answer, resp.search_results = self._run_rag_query(query)
+            context_prefix = self._request_context_prefix(
+                query,
+                mode="rag",
+                phase="generate",
+                query_embedding=query_embedding,
+                trace_sink=pr["context_trace"],
+                on_event=on_event,
+            )
+            resp.answer, resp.search_results = self._run_rag_query(
+                query, context_prefix
+            )
             _emit(on_event, "rag_result", {"search_results": resp.search_results})
             _emit(on_event, "token", {"content": resp.answer})
         else:
-            resp.answer = self._chat_response(mem_prefix, hist_msgs, token, on_event)
+            context_prefix = self._request_context_prefix(
+                query,
+                mode="chat",
+                phase="generate",
+                query_embedding=query_embedding,
+                trace_sink=pr["context_trace"],
+                on_event=on_event,
+            )
+            resp.answer = self._chat_response(
+                context_prefix, hist_msgs, token, on_event
+            )
 
     # ── finalize ─────────────────────────────────────────────────────────────
 
@@ -590,14 +642,90 @@ class UnifiedAgent:
             interrupted_at=task.get("interrupted_at", ""),
         )
 
-    def _build_context_prefix(self, query: str, mode: str = "chat") -> str:
+    def _compute_query_embedding(self, query: str) -> List[float]:
+        is_real = getattr(self.cfg, "is_real_embedding", None)
+        if not callable(is_real) or not is_real():
+            return []
+        try:
+            return list(self.llm.embed(query) or [])
+        except Exception as e:
+            logger.warning("⚠️  Context query embedding 失败，使用词法召回: %s", e)
+            return []
+
+    def _assemble_context(
+        self,
+        query: str,
+        mode: str = "chat",
+        phase: str = "",
+        query_embedding: Optional[List[float]] = None,
+        task_id: str = "",
+    ):
         if not hasattr(self, "prompt_assembler"):
             self._build_prompt_context()
         try:
-            return self.prompt_assembler.assemble(Query(text=query, mode=mode)).render()
+            embedding = query_embedding
+            if embedding is None:
+                embedding = self._compute_query_embedding(query)
+            return self.prompt_assembler.assemble(
+                Query(
+                    text=query,
+                    embedding=list(embedding or []),
+                    task_id=task_id,
+                    mode=mode,
+                    phase=phase,
+                )
+            )
         except Exception as e:
-            logger.warning("⚠️  promptctx 装配失败，降级到旧记忆前缀: %s", e)
-            return self._build_memory_system_prefix(query)
+            logger.warning("⚠️  promptctx 装配失败，本次使用空 Context: %s", e)
+            return None
+
+    def _build_context_prefix(
+        self,
+        query: str,
+        mode: str = "chat",
+        phase: str = "",
+        query_embedding: Optional[List[float]] = None,
+        task_id: str = "",
+    ) -> str:
+        context = self._assemble_context(
+            query,
+            mode,
+            phase,
+            query_embedding,
+            task_id,
+        )
+        return context.render() if context is not None else ""
+
+    def _request_context_prefix(
+        self,
+        query: str,
+        *,
+        mode: str,
+        phase: str,
+        query_embedding: Optional[List[float]],
+        task_id: str = "",
+        trace_sink: Optional[List[dict]] = None,
+        on_event=None,
+    ) -> str:
+        context = self._assemble_context(
+            query,
+            mode,
+            phase,
+            query_embedding,
+            task_id,
+        )
+        rendered = context.render() if context is not None else ""
+        entry = {
+            "mode": mode,
+            "phase": phase,
+            "prompt_version": PROMPT_VERSION,
+            "prompt_chars": len(rendered),
+            "slots": list(context.trace) if context is not None else [],
+        }
+        if trace_sink is not None:
+            trace_sink.append(entry)
+        _emit(on_event, "context", entry)
+        return rendered
 
     def push_task_mem(self, obs: StepObservation) -> None:
         if hasattr(self, "task_mem"):
@@ -645,11 +773,19 @@ class UnifiedAgent:
     def _recent_history_for_rag(self) -> List[HistoryMessage]:
         return [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()]
 
-    def _run_rag_query(self, query: str):
+    def _run_rag_query(self, query: str, context_prefix: str = ""):
         if self.rag is None:
             return "RAG 不可用", []
         if hasattr(self.rag, "query_with_history"):
-            return self.rag.query_with_history(query, self._recent_history_for_rag())
+            if not context_prefix:
+                return self.rag.query_with_history(
+                    query, self._recent_history_for_rag()
+                )
+            return self.rag.query_with_history(
+                query,
+                self._recent_history_for_rag(),
+                context_prefix=context_prefix,
+            )
         return self.rag.query(query)
 
     def _build_history_messages(self, query: str) -> List[Message]:
@@ -659,9 +795,7 @@ class UnifiedAgent:
         return msgs
 
     def _chat_response(self, mem_prefix: str, hist_msgs: List[Message], token=None, on_event=None) -> str:
-        system_prompt = "你是一个简洁的AI助手。结合你掌握的用户信息，使回答更个性化。"
-        if mem_prefix:
-            system_prompt = mem_prefix + "\n\n" + system_prompt
+        system_prompt = compose_system_prompt(CHAT_SYSTEM_PROMPT, mem_prefix)
         return self._chat_llm(system_prompt, hist_msgs, token, on_event)
 
     def _chat_llm(self, system_prompt: str, messages: List[Message], token=None, on_event=None) -> str:
@@ -743,16 +877,25 @@ class UnifiedAgent:
         }
         _emit(on_event, "tool_call", tool_call)
         if result.success:
-            system_prompt = "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。"
-            if mem_prefix:
-                system_prompt = mem_prefix + "\n\n" + system_prompt
+            system_prompt = compose_system_prompt(
+                TOOL_RESULT_SYSTEM_PROMPT, mem_prefix
+            )
             user_msg = f"用户问：{query}\n工具 {tool_name} 返回结果：{result.content}\n请根据结果自然地回答用户。"
             answer = self._chat_llm(system_prompt, [Message(role="user", content=user_msg)], token, on_event)
         return answer, tool_call
 
     # ── 图调度（统一 react 入口） ──────────────────────────────────────────
 
-    def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token, on_event=None):
+    def _run_react_with_tools(
+        self,
+        query: str,
+        tools_map: Dict[str, Tool],
+        hist_msgs: List[Message],
+        query_embedding: Optional[List[float]],
+        token,
+        on_event=None,
+        context_trace: Optional[List[dict]] = None,
+    ):
         """ReAct 模式入口：与 main 分支 runReAct 行为一致。
 
         - llm_plan_graph 拿到节点列表；
@@ -760,13 +903,44 @@ class UnifiedAgent:
         - 节点非空 → 走 GraphRuntime 拓扑分层 + race + 重试；执行结束后用
           _generate_final_answer（对应 Go llmGenerate）合成自然语言回复。
         """
-        task = {"task_id": f"task_{int(time.time())}", "query": query, "status": "running", "steps": []}
+        task = {
+            "task_id": f"task_{int(time.time())}",
+            "query": query,
+            "status": "running",
+            "phase": "planning",
+            "steps": [],
+        }
+        if hasattr(self, "task_mem"):
+            self.task_mem.reset()
         self._cancel_registry.set_task(task)
         try:
-            plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
+            plan_context = self._request_context_prefix(
+                query,
+                mode="react",
+                phase="plan",
+                query_embedding=query_embedding,
+                task_id=task["task_id"],
+                trace_sink=context_trace,
+                on_event=on_event,
+            )
+            plan_nodes = llm_plan_graph(self, query, tools_map, plan_context)
             if not plan_nodes:
                 # 与 Go runReAct: planNodes 空 → chatLLM 一句话答复
-                return self._chat_response(mem_prefix, hist_msgs, token, on_event), [], task
+                fallback_embedding = query_embedding or self._compute_query_embedding(
+                    query
+                )
+                chat_context = self._request_context_prefix(
+                    query,
+                    mode="chat",
+                    phase="generate",
+                    query_embedding=fallback_embedding,
+                    task_id=task["task_id"],
+                    trace_sink=context_trace,
+                    on_event=on_event,
+                )
+                return self._chat_response(
+                    chat_context, hist_msgs, token, on_event
+                ), [], task
 
             from internal.graph.task_graph import TaskGraph
 
@@ -782,6 +956,7 @@ class UnifiedAgent:
                 race_timeout_ms=getattr(self.cfg, "graph_race_timeout_ms", 30000),
                 enable_racing=getattr(self.cfg, "graph_enable_racing", True),
             )
+            task["phase"] = "executing"
             result = GraphRuntime(graph, self, cfg, tools_map, task).execute(token)
             steps = [
                 ReActStep(
@@ -792,7 +967,19 @@ class UnifiedAgent:
                 )
                 for node in graph.nodes.values()
             ]
-            final_answer = self._generate_final_answer(query, steps, mem_prefix, token, on_event)
+            task["phase"] = "generating"
+            final_context = self._request_context_prefix(
+                query,
+                mode="react",
+                phase="generate",
+                query_embedding=query_embedding,
+                task_id=task["task_id"],
+                trace_sink=context_trace,
+                on_event=on_event,
+            )
+            final_answer = self._generate_final_answer(
+                query, steps, final_context, token, on_event
+            )
             steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
             task["status"] = "interrupted" if result.interrupted else "completed"
             task["graph"] = {
@@ -813,20 +1000,18 @@ class UnifiedAgent:
 
     def _generate_final_answer(self, query: str, steps: List[ReActStep], mem_prefix: str, token=None, on_event=None) -> str:
         steps_str = "\n".join(f"{s.type}: {s.content}" for s in steps)
-        prompt = f"""基于以下推理过程，给出最终答案。
+        prompt = f"""任务: {query}
 
-任务: {query}
-
-记忆上下文:
-{mem_prefix or '（无）'}
-
-推理过程:
+已完成的推理过程:
 {steps_str}
 
 请用自然语言总结最终答案，不要包含 Action/Final 等关键字。
 """
         messages = [Message(role="user", content=prompt)]
-        return self._chat_llm("你是一个总结助手，能够基于推理过程给出简洁的最终答案。", messages, token, on_event)
+        system_prompt = compose_system_prompt(
+            REACT_FINAL_SYSTEM_PROMPT, mem_prefix
+        )
+        return self._chat_llm(system_prompt, messages, token, on_event)
 
     def _save_agent_snapshot(self, query: str, resp: Response):
         """每 N 轮把 agent 整体状态序列化到 PG（含路由 mode/计数/偏好）。"""
@@ -886,6 +1071,26 @@ def _emit(on_event, event_type: str, data: Any) -> None:
     if on_event is None:
         return
     on_event({"type": event_type, "data": _to_jsonable(data)})
+
+
+def _prompt_trace_count(llm) -> int:
+    fn = getattr(llm, "prompt_trace_count", None)
+    if not callable(fn):
+        return 0
+    try:
+        return int(fn())
+    except Exception:
+        return 0
+
+
+def _prompt_traces_since(llm, start: int) -> List[dict]:
+    fn = getattr(llm, "prompt_traces_since", None)
+    if not callable(fn):
+        return []
+    try:
+        return list(fn(start) or [])
+    except Exception:
+        return []
 
 
 def _to_jsonable(value: Any) -> Any:

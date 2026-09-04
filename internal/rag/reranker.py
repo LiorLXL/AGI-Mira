@@ -3,6 +3,8 @@ import logging
 import re
 from typing import Callable, List, Optional
 
+from internal.promptctx.prompts import RAG_RERANK_SYSTEM_PROMPT
+
 logger = logging.getLogger(__name__)
 
 GenerateFn = Callable[[str, str], str]
@@ -71,22 +73,7 @@ class LLMReranker:
         return _truncate(out, top_k)
 
     def _system_prompt(self) -> str:
-        return (
-            "你是检索系统的精排器。给定用户问题和若干候选段落（每条带编号 idx），"
-            "判断每条段落对回答该问题的**相关性 + 信息密度**，给 0~10 的整数分。\n\n"
-            "打分准则：\n"
-            "- 10：直接回答了问题\n"
-            "- 7~9：包含明确相关事实 / 线索\n"
-            "- 4~6：弱相关 / 部分相关\n"
-            "- 1~3：仅出现共现关键词，不能用来回答\n"
-            "- 0：无关 / 噪声\n\n"
-            "输出**严格 JSON**，不要任何说明文字、不要 markdown 代码块：\n"
-            "{\"scores\": [{\"idx\": 0, \"score\": 9}, {\"idx\": 1, \"score\": 3}]}\n\n"
-            "约束：\n"
-            "- scores 数量严格等于候选数量\n"
-            "- score 是 0~10 的整数\n"
-            "- 不依赖你自己的知识，只看给出的段落"
-        )
+        return RAG_RERANK_SYSTEM_PROMPT
 
     def _user_msg(self, query: str, results: List) -> str:
         count = len(results)

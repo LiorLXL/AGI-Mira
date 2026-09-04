@@ -27,8 +27,10 @@ class RuntimeContextSchema:
     slots: List[Slot] = field(default_factory=list)
 
 
-# 全局总预算（字符数；约等于 token 上限的 4 倍）
-DEFAULT_GLOBAL_TOKEN_BUDGET = 2400
+# 全局总预算是字符数，不等同于模型 token。
+DEFAULT_GLOBAL_CHAR_BUDGET = 2400
+# 向后兼容旧导入名。
+DEFAULT_GLOBAL_TOKEN_BUDGET = DEFAULT_GLOBAL_CHAR_BUDGET
 
 
 # ChatSchema 普通对话：偏好 + 兜底召回；不需要 Planner / TaskMem / ToolState
@@ -36,16 +38,11 @@ CHAT_SCHEMA = RuntimeContextSchema(
     mode="chat",
     slots=[
         Slot(
-            kind=SlotConstraints,
-            required=False,
-            filter=SlotFilter(token_budget=200),
-        ),
-        Slot(
             kind=SlotProfile,
             required=False,
             filter=SlotFilter(
                 categories=["identity", "preference"],
-                token_budget=300,
+                char_budget=300,
                 top_k=10,
             ),
         ),
@@ -56,44 +53,25 @@ CHAT_SCHEMA = RuntimeContextSchema(
                 categories=["episodic", "fact", "general"],
                 top_k=3,
                 min_score=0.4,
-                token_budget=400,
+                char_budget=400,
             ),
         ),
     ],
 )
 
 
-# ToolSchema 单工具调用：弱化 Recall，强化 Tool State；不需要 Planner / TaskMem
+# Tool result generation: profile + current tool result (the result is supplied
+# by the call site, not duplicated in ToolState).
 TOOL_SCHEMA = RuntimeContextSchema(
     mode="tool",
     slots=[
-        Slot(
-            kind=SlotConstraints,
-            required=False,
-            filter=SlotFilter(token_budget=200),
-        ),
         Slot(
             kind=SlotProfile,
             required=False,
             filter=SlotFilter(
                 categories=["identity", "preference"],
-                token_budget=250,
+                char_budget=250,
                 top_k=8,
-            ),
-        ),
-        Slot(
-            kind=SlotToolState,
-            required=True,
-            filter=SlotFilter(token_budget=350, top_k=6),
-        ),
-        Slot(
-            kind=SlotRecall,
-            required=False,
-            filter=SlotFilter(
-                categories=["episodic", "fact", "general"],
-                top_k=2,
-                min_score=0.5,
-                token_budget=250,
             ),
         ),
     ],
@@ -107,29 +85,29 @@ REACT_SCHEMA = RuntimeContextSchema(
         Slot(
             kind=SlotConstraints,
             required=True,
-            filter=SlotFilter(token_budget=280),
+            filter=SlotFilter(char_budget=280),
         ),
         Slot(
             kind=SlotPlanner,
             required=True,
-            filter=SlotFilter(token_budget=300),
+            filter=SlotFilter(char_budget=300),
         ),
         Slot(
             kind=SlotTaskMem,
             required=False,
-            filter=SlotFilter(token_budget=350, top_k=8, max_age_hours=24),
+            filter=SlotFilter(char_budget=350, top_k=8, max_age_hours=24),
         ),
         Slot(
             kind=SlotToolState,
             required=True,
-            filter=SlotFilter(token_budget=350, top_k=8),
+            filter=SlotFilter(char_budget=350, top_k=8),
         ),
         Slot(
             kind=SlotProfile,
             required=False,
             filter=SlotFilter(
                 categories=["identity", "preference"],
-                token_budget=250,
+                char_budget=250,
                 top_k=6,
             ),
         ),
@@ -140,7 +118,7 @@ REACT_SCHEMA = RuntimeContextSchema(
                 categories=["episodic", "fact", "general", "tool_failure"],
                 top_k=2,
                 min_score=0.5,
-                token_budget=200,
+                char_budget=200,
             ),
         ),
     ],
@@ -154,14 +132,14 @@ RAG_SCHEMA = RuntimeContextSchema(
         Slot(
             kind=SlotConstraints,
             required=False,
-            filter=SlotFilter(token_budget=200),
+            filter=SlotFilter(char_budget=200),
         ),
         Slot(
             kind=SlotProfile,
             required=False,
             filter=SlotFilter(
                 categories=["identity", "preference"],
-                token_budget=300,
+                char_budget=300,
                 top_k=8,
             ),
         ),
@@ -172,7 +150,67 @@ RAG_SCHEMA = RuntimeContextSchema(
                 categories=["episodic", "fact", "general"],
                 top_k=3,
                 min_score=0.4,
-                token_budget=400,
+                char_budget=400,
+            ),
+        ),
+    ],
+)
+
+
+# Phase-specific schemas used by production call sites.  The legacy mode-only
+# schemas remain available for compatibility with existing callers/tests.
+REACT_PLAN_SCHEMA = RuntimeContextSchema(
+    mode="react.plan",
+    slots=[
+        Slot(
+            kind=SlotConstraints,
+            required=True,
+            filter=SlotFilter(char_budget=280),
+        ),
+        Slot(
+            kind=SlotProfile,
+            required=False,
+            filter=SlotFilter(
+                categories=["identity", "preference"],
+                char_budget=250,
+                top_k=6,
+            ),
+        ),
+    ],
+)
+
+
+REACT_GENERATE_SCHEMA = RuntimeContextSchema(
+    mode="react.generate",
+    slots=[
+        Slot(
+            kind=SlotProfile,
+            required=False,
+            filter=SlotFilter(
+                categories=["identity", "preference"],
+                char_budget=250,
+                top_k=6,
+            ),
+        ),
+        Slot(
+            kind=SlotTaskMem,
+            required=False,
+            filter=SlotFilter(char_budget=500, top_k=8, max_age_hours=24),
+        ),
+    ],
+)
+
+
+RAG_GENERATE_SCHEMA = RuntimeContextSchema(
+    mode="rag.generate",
+    slots=[
+        Slot(
+            kind=SlotProfile,
+            required=False,
+            filter=SlotFilter(
+                categories=["identity", "preference"],
+                char_budget=300,
+                top_k=8,
             ),
         ),
     ],
@@ -180,12 +218,15 @@ RAG_SCHEMA = RuntimeContextSchema(
 
 
 def default_schemas() -> Dict[str, RuntimeContextSchema]:
-    """返回 4 个内置 Schema，按 Mode 字符串索引。"""
+    """返回 mode 兼容 Schema 与生产调用使用的 phase Schema。"""
     return {
         "chat": CHAT_SCHEMA,
         "tool": TOOL_SCHEMA,
         "react": REACT_SCHEMA,
         "rag": RAG_SCHEMA,
+        "react.plan": REACT_PLAN_SCHEMA,
+        "react.generate": REACT_GENERATE_SCHEMA,
+        "rag.generate": RAG_GENERATE_SCHEMA,
     }
 
 

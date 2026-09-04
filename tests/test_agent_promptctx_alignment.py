@@ -101,8 +101,8 @@ def test_agent_react_uses_graph_runtime_path():
     answer, steps, task = agent._run_react_with_tools(
         "搜索 RAG 是什么",
         agent.tool_executor._tool_map,
-        agent._build_context_prefix("搜索 RAG 是什么", "react"),
         [Message(role="user", content="搜索 RAG 是什么")],
+        [],
         None,
     )
 

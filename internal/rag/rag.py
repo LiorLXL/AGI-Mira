@@ -10,6 +10,7 @@ from internal.graph.kgstore import KGStore
 from internal.graph.types import ChunkRef
 from internal.infra.infra import Infrastructure, RAG_COLLECTION
 from internal.llm.llm import Client as LLMClient
+from internal.promptctx.prompts import RAG_GENERATE_SYSTEM_PROMPT, compose_system_prompt
 from internal.rag.hybrid import HybridStore
 from internal.rag.rewriter import HistoryMessage
 from internal.rag.splitter import Chunk, RecursiveSplitter
@@ -120,7 +121,12 @@ class Engine:
     def query(self, question: str) -> Tuple[str, List[dict]]:
         return self.query_with_history(question, [])
 
-    def query_with_history(self, question: str, history: Optional[List[HistoryMessage]] = None) -> Tuple[str, List[dict]]:
+    def query_with_history(
+        self,
+        question: str,
+        history: Optional[List[HistoryMessage]] = None,
+        context_prefix: str = "",
+    ) -> Tuple[str, List[dict]]:
         if not self.loaded:
             return "知识库为空，请先上传文档。", []
         if self.inf.ready.postgresql != "connected":
@@ -146,7 +152,7 @@ class Engine:
                 for h in hybrid_hits
             ]
             ask_query = queries[0] if queries else question
-            return self._compose_answer(ask_query, fused)
+            return self._compose_answer(ask_query, fused, context_prefix)
 
         if self._hybrid is not None:
             hybrid_hits = self._hybrid.search_multi(queries, top_k)
@@ -160,11 +166,16 @@ class Engine:
                 for h in hybrid_hits
             ]
             ask_query = queries[0] if queries else question
-            return self._compose_answer(ask_query, fused)
+            return self._compose_answer(ask_query, fused, context_prefix)
 
-        return self._compose_answer(question, [])
+        return self._compose_answer(question, [], context_prefix)
 
-    def _compose_answer(self, question: str, fused: List[dict]) -> Tuple[str, List[dict]]:
+    def _compose_answer(
+        self,
+        question: str,
+        fused: List[dict],
+        context_prefix: str = "",
+    ) -> Tuple[str, List[dict]]:
         fused = self._dedupe_results_by_content(fused)
         if not fused:
             return "知识库中未找到相关内容。", []
@@ -174,9 +185,8 @@ class Engine:
             return "知识库中未找到相关内容。", []
 
         if self._generate_fn:
-            system_prompt = (
-                "你是一个基于知识库回答问题的助手。请仅根据提供的上下文内容回答问题，"
-                "不要编造信息。如果上下文不足以回答，请说明。"
+            system_prompt = compose_system_prompt(
+                RAG_GENERATE_SYSTEM_PROMPT, context_prefix
             )
             user_msg = f"上下文：\n{context}\n\n问题：{question}"
             return self._generate_fn(system_prompt, user_msg), fused

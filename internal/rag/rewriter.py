@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
+from internal.promptctx.prompts import rag_rewrite_system_prompt
+
 logger = logging.getLogger(__name__)
 
 GenerateFn = Callable[[str, str], str]
@@ -36,20 +38,7 @@ class LLMRewriter:
             return [query]
 
         user_msg = self._build_user_msg(query, history)
-        system_prompt = (
-            "你是检索系统的查询改写助手。给定用户当前问题和最近对话历史，你需要：\n"
-            "1) 先把当前问题改写成一句**自包含的独立查询**（消除指代、补全省略，"
-            "只用 query 本身就能让人看懂）。\n"
-            "2) 再生成若干条**等价但措辞不同**的查询变体（同义词替换、抽象/具体切换、不同语序）。\n\n"
-            "输出**严格 JSON**，不要任何说明文字、不要 markdown 代码块：\n"
-            "{\"queries\": [\"独立查询\", \"变体1\", \"变体2\"]}\n\n"
-            "约束：\n"
-            f"- 总条数严格等于 {self.num_queries}\n"
-            "- 每条不超过 50 字\n"
-            "- 第一条必须可独立检索（不依赖历史）\n"
-            "- 不要编造历史中未出现的人名、机构、产品名等实体\n"
-            "- 只输出 JSON 数组结构，禁止任何前后说明文字"
-        )
+        system_prompt = rag_rewrite_system_prompt(self.num_queries)
         raw = ""
         try:
             raw = self.generate_fn(system_prompt, user_msg)
