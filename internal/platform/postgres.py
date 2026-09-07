@@ -1,5 +1,6 @@
 # postgres — PostgreSQL 平台层薄封装：连接、健康检查、schema bootstrap、关键 SQL 操作。
 # 失败时降级到 mock（self._conn 为 None），不阻塞应用启动。
+from contextlib import contextmanager
 import logging
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
@@ -56,6 +57,8 @@ _DDLS: List[str] = [
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags          JSONB NOT NULL DEFAULT '[]'::jsonb",
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint     VARCHAR(64) NOT NULL DEFAULT ''",
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS score         DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS last_decayed_at DOUBLE PRECISION",
+    "UPDATE long_term_memory SET last_decayed_at = EXTRACT(EPOCH FROM NOW()) WHERE last_decayed_at IS NULL",
     "CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)",
     "CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)",
     """CREATE TABLE IF NOT EXISTS rag_chunks (
@@ -79,7 +82,7 @@ class PostgresClient:
         self._pool = None
         self.status: str = "disconnected"
         self._connect()
-        if self._conn is not None:
+        if self.is_real():
             self.bootstrap_schema()
 
     # ─── 连接 ───
@@ -125,6 +128,14 @@ class PostgresClient:
     def _release(self, conn) -> None:
         if self._pool is not None and conn is not None:
             self._pool.putconn(conn)
+
+    @contextmanager
+    def transaction(self):
+        conn = self._borrow()
+        try:
+            yield conn
+        finally:
+            self._release(conn)
 
     # ─── Schema bootstrap ───
     def bootstrap_schema(self) -> None:

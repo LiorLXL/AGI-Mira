@@ -17,6 +17,25 @@ from .slot import (
 )
 
 
+class ContextText(str):
+    """Rendered text with a one-shot acknowledgement at the LLM boundary."""
+
+    def __new__(cls, text, on_used):
+        instance = super().__new__(cls, text)
+        instance._on_used = on_used
+        return instance
+
+    def mark_used(self):
+        callback, self._on_used = self._on_used, None
+        if callback is not None:
+            callback()
+
+
+def mark_context_used(text):
+    if isinstance(text, ContextText):
+        text.mark_used()
+
+
 @dataclass
 class RuntimeContext:
     """一次装配的全部结果，可通过 render 得到 System Prompt 前缀。"""

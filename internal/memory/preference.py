@@ -5,12 +5,48 @@
 #     做读写；main 分支由更高层装配 user_id，这里出于历史原因保持现状不动。
 #   - ExtractAndSave 规则、BuildContext 输出格式、对外方法签名严格对齐。
 import logging
+import re
 import threading
 from typing import Dict, Optional, Tuple
 
 from internal.infra.infra import Infrastructure
 
 logger = logging.getLogger(__name__)
+
+
+# Feature 001: only these stable profile keys may be activated by the automatic
+# user-memory pipeline. Existing legacy keys remain readable for compatibility.
+PREFERENCE_KEY_ALIASES = {
+    "姓名": {"姓名", "名字", "称呼", "name", "username", "user_name"},
+    "城市": {
+        "城市", "居住城市", "常住城市", "工作城市", "所在地", "居住地",
+        "city", "location", "location_name",
+    },
+    "时区": {"时区", "timezone", "time_zone", "tz"},
+    "语言": {"语言", "偏好语言", "回复语言", "language", "lang"},
+    "国家": {"国家", "国籍", "country", "nation"},
+    "职业": {"职业", "工作", "工作岗位", "职位", "occupation", "job"},
+    "喜好": {"喜好", "喜欢", "爱好", "兴趣", "preference", "hobby"},
+    "禁忌": {"禁忌", "不喜欢", "讨厌", "避免", "dislike", "avoid"},
+    "回答风格": {
+        "回答风格", "回复风格", "表达风格", "回答偏好", "response_style",
+    },
+}
+
+ALLOWED_PREFERENCE_KEYS = tuple(PREFERENCE_KEY_ALIASES)
+_PREFERENCE_ALIAS_LOOKUP = {
+    re.sub(r"[\s_\-]+", "", alias).lower(): canonical
+    for canonical, aliases in PREFERENCE_KEY_ALIASES.items()
+    for alias in aliases
+}
+
+
+def normalize_preference_key(key: str) -> Optional[str]:
+    """Map a supported alias to its canonical profile key."""
+    normalized = re.sub(r"[\s_\-]+", "", str(key or "").strip()).lower()
+    if not normalized:
+        return None
+    return _PREFERENCE_ALIAS_LOOKUP.get(normalized)
 
 
 class Preference:
@@ -97,4 +133,9 @@ class Preference:
         return "【用户偏好】\n" + "\n".join(lines)
 
 
-__all__ = ["Preference"]
+__all__ = [
+    "Preference",
+    "ALLOWED_PREFERENCE_KEYS",
+    "PREFERENCE_KEY_ALIASES",
+    "normalize_preference_key",
+]

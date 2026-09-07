@@ -44,6 +44,7 @@ class Item:
     status: str = "active"
     superseded_by: Optional[int] = None
     quarantine_reason: str = ""
+    last_decayed_at: float = 0.0
 
 
 @dataclass
@@ -66,13 +67,14 @@ class ConsolidationResult:
     """LongTerm.consolidate 的结构化返回。
 
     与 main 分支 Go ConsolidationResult 对齐：调用方据此向 PG / 图同步删除与更新，
-    consolidate 自身只改内存。
+    生产仓储支持事务时，consolidate 提交 PG 后才发布内存状态。
     """
     deduped: int = 0
     merged: int = 0
     expired: int = 0
     delete_from_db: List[int] = field(default_factory=list)
     update_in_db: List["Item"] = field(default_factory=list)
+    persisted: bool = False
 
 
 class ShortTerm:
@@ -160,6 +162,7 @@ class LongTerm:
             status=item.status,
             superseded_by=item.superseded_by,
             quarantine_reason=item.quarantine_reason,
+            last_decayed_at=item.last_decayed_at,
         )
 
     def set_embed_fn(self, fn):
@@ -194,6 +197,8 @@ class LongTerm:
             elif not isinstance(last_ts, (int, float)) or not last_ts:
                 last_ts = created_ts
             self.items.append(Item(
+                id=r.id,
+                last_decayed_at=float(getattr(r, "last_decayed_at", 0.0) or created_ts),
                 content=r.content,
                 importance=r.importance,
                 embedding=r.embedding,
@@ -208,9 +213,7 @@ class LongTerm:
                 quarantine_reason=getattr(r, "quarantine_reason", "") or "",
             ))
         # 重建 id 序列，确保后续 add 不与已有 item 冲突
-        for idx, item in enumerate(self.items):
-            item.id = idx
-        self._next_id = len(self.items)
+        self._next_id = max((item.id for item in self.items), default=0) + 1
         logger.info("✅ 从存储恢复了 %d 条长期记忆", len(self.items))
         # 图增强记忆 hook：批量索引（启动期把 LTM 全量同步进图）
         if self.graph_memory is not None:
@@ -227,48 +230,44 @@ class LongTerm:
             except Exception as e:
                 logger.warning("⚠️  向量化失败: %s", e)
 
-        now_ts = time.time()
-        item = Item(
-            content=content,
-            importance=importance,
-            embedding=embedding,
-            id=self._next_id,
-            created_at=now_ts,
-            last_accessed=now_ts,
+        now = time.time()
+        item = Item(content=content, importance=importance, embedding=embedding,
+                    created_at=now, last_accessed=now, last_decayed_at=now)
+        with self._lock:
+            return self._insert_item(item)
+
+    def _insert_item(self, item: Item) -> Item:
+        """Publish to memory/graph only after PG confirms a real primary key."""
+        pg_id = self.inf.repo.ltm.save(
+            item.content, item.importance,
+            json.dumps(item.embedding) if item.embedding else "null",
+            created_at=item.created_at, last_accessed=item.last_accessed,
+            category=item.category, tags=item.tags,
+            slot_hint=item.slot_hint, score=item.score,
         )
-        self._next_id += 1
-        # 旧条目快照（add_to_graph 内会扫描这些建立 SIMILAR_TO 边）
-        prior = list(self.items)
+        if isinstance(pg_id, bool) or not isinstance(pg_id, int) or pg_id <= 0:
+            raise RuntimeError("Long-term memory was not persisted")
+        item.id = pg_id
+        self._next_id = max(self._next_id, pg_id + 1)
+        prior = self.snapshot()
         self.items.append(item)
         self._items_since_last += 1
-        emb_json = json.dumps(embedding) if embedding else "null"
-        self.inf.repo.ltm.save(
-            content,
-            importance,
-            emb_json,
-            created_at=now_ts,
-            last_accessed=now_ts,
-            category=item.category,
-            tags=item.tags,
-            slot_hint=item.slot_hint,
-            score=item.score,
-        )
-        _publish_event(self.inf, "memory.longterm.add", {
-            "id": item.id,
-            "content": content,
-            "importance": importance,
-            "category": item.category,
-            "tags": item.tags,
-        })
-
-        # 图增强记忆 hook：新增条目同步进图
         if self.graph_memory is not None:
             try:
-                self.graph_memory.add_to_graph(item, neighbors=prior[-50:])
-            except Exception as e:
-                logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
+                self.graph_memory.add_to_graph(self._copy_item(item), neighbors=prior[-50:])
+            except Exception as exc:
+                logger.warning("Graph projection failed after PG save: %s", type(exc).__name__)
+        _publish_event(self.inf, "memory.longterm.add", {
+            "id": item.id, "content": item.content, "importance": item.importance,
+            "category": item.category, "tags": item.tags, "persisted": True,
+        })
+        return self._copy_item(item)
 
-    def store_classified(
+    def store_classified(self, content, importance, emb, category, tags, slot_hint) -> bool:
+        with self._lock:
+            return self._store_classified(content, importance, emb, category, tags, slot_hint)
+
+    def _store_classified(
         self,
         content: str,
         importance: float,
@@ -304,7 +303,7 @@ class LongTerm:
                     best_sim = sim
                     best_idx = idx
             if best_idx >= 0 and best_sim >= dedup_threshold:
-                target = self.items[best_idx]
+                target = self._copy_item(self.items[best_idx])
                 if importance > target.importance:
                     target.importance = importance
                 if tags:
@@ -320,10 +319,9 @@ class LongTerm:
                     target.category = category
                 if slot_hint and target.slot_hint == "":
                     target.slot_hint = slot_hint
-                target.last_accessed = time.time()
                 if target.id is not None:
                     try:
-                        self.inf.repo.ltm.update_classified(
+                        outcome = self.inf.repo.ltm.update_classified(
                             target.id,
                             target.importance,
                             target.tags,
@@ -331,8 +329,11 @@ class LongTerm:
                             target.slot_hint,
                             target.last_accessed,
                         )
-                    except Exception as e:
-                        logger.warning("⚠️  store_classified update_classified 失败: %s", e)
+                        if outcome is False:
+                            raise RuntimeError("Memory dedup update was not persisted")
+                    except Exception:
+                        raise
+                self.items[best_idx] = target
                 if self.graph_memory is not None:
                     try:
                         self.graph_memory.update_node(target)
@@ -348,57 +349,13 @@ class LongTerm:
                 })
                 return False
 
-        now_ts = time.time()
-        new_item = Item(
-            content=content,
-            importance=importance,
+        now = time.time()
+        self._insert_item(Item(
+            content=content, importance=importance,
             embedding=list(emb) if emb else None,
-            id=self._next_id,
-            created_at=now_ts,
-            last_accessed=now_ts,
-            category=category if category else "general",
-            tags=tags,
-            slot_hint=slot_hint,
-            score=0.0,
-        )
-        self._next_id += 1
-        prior = list(self.items)
-        self.items.append(new_item)
-        self._items_since_last += 1
-        emb_json = json.dumps(new_item.embedding) if new_item.embedding else "null"
-        try:
-            pg_id = self.inf.repo.ltm.save(
-                content,
-                importance,
-                emb_json,
-                created_at=now_ts,
-                last_accessed=now_ts,
-                category=new_item.category,
-                tags=new_item.tags,
-                slot_hint=new_item.slot_hint,
-                score=new_item.score,
-            )
-            if isinstance(pg_id, int) and pg_id > 0:
-                new_item.id = pg_id
-                if pg_id >= self._next_id:
-                    self._next_id = pg_id + 1
-        except Exception as e:
-            logger.warning("⚠️  store_classified save 失败: %s", e)
-
-        if self.graph_memory is not None:
-            try:
-                self.graph_memory.add_to_graph(new_item, neighbors=prior[-50:])
-            except Exception as e:
-                logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
-        _publish_event(self.inf, "memory.longterm.add", {
-            "id": new_item.id,
-            "content": content,
-            "importance": importance,
-            "category": new_item.category,
-            "tags": new_item.tags,
-            "slot_hint": new_item.slot_hint,
-            "reason": "classified",
-        })
+            created_at=now, last_accessed=now, last_decayed_at=now,
+            category=category or "general", tags=tags, slot_hint=slot_hint,
+        ))
         return True
 
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
@@ -414,18 +371,7 @@ class LongTerm:
                 logger.warning("⚠️  查询向量化失败: %s", e)
                 query_emb = None
 
-        if not query_emb:
-            return [self._copy_item(item) for item in active[:top_k]]
-
-        scored: List[tuple] = []
-        for item in active:
-            if item.embedding:
-                sim = self._cosine_similarity(query_emb, item.embedding)
-                score = sim * 0.7 + item.importance * 0.3
-                scored.append((item, score))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [self._copy_item(item, score=score) for item, score in scored[:top_k] if score >= 0.4]
+        return self.recall_by_filter(query, query_emb, RecallFilter(top_k=top_k))
 
     def recall_by_filter(
         self,
@@ -441,7 +387,7 @@ class LongTerm:
 
         过滤顺序：categories（命中其一）→ require_tags（必须全部包含）→
         max_age_hours（按 created_at 计算）→ 计算 sim → score = sim*0.7 +
-        importance*0.3，>= threshold 时回写 ``last_accessed`` 并加入候选；
+        importance*0.3，>= threshold 时加入候选；此方法不更新访问时间；
         最后按 score desc 排序，可选按 top_k 截断。
         """
         with self._lock:
@@ -461,9 +407,7 @@ class LongTerm:
             use_tf = not query_embedding
 
             # 当走 TF fallback 时，预先分词 query 用于复用
-            query_tokens: Optional[List[str]] = None
-            if use_tf:
-                query_tokens = _tokenize_zh(query)
+            query_tokens = _tokenize_zh(query)
 
             candidates: List[Item] = []
             for item in active:
@@ -498,14 +442,32 @@ class LongTerm:
                 if score < threshold:
                     continue
 
-                # 命中：回写 last_accessed，并产出 Item 副本（设置 score 字段）
-                item.last_accessed = now
+                # Read-only selection; the caller confirms actual Prompt use.
                 candidates.append(self._copy_item(item, score=score))
 
             candidates.sort(key=lambda it: it.score, reverse=True)
             if top_k > 0 and len(candidates) > top_k:
                 candidates = candidates[:top_k]
             return candidates
+
+    def mark_accessed(self, ids: List[int]) -> None:
+        """Confirm only memories retained in the final Prompt context."""
+        now = time.time()
+        selected = set(ids)
+        with self._lock:
+            items = [it for it in self.items if it.id in selected and it.status == "active"]
+            if not items:
+                return
+            touch = getattr(self.inf.repo.ltm, "touch", None)
+            try:
+                if callable(touch) and touch([it.id for it in items], now) is False:
+                    logger.warning("Memory access update failed")
+                    return
+            except Exception as exc:
+                logger.warning("Memory access update failed: %s", type(exc).__name__)
+                return
+            for item in items:
+                item.last_accessed = now
 
     def _tf_cosine(self, query_tokens: Optional[List[str]], content: str) -> float:
         """TF 词袋 cosine：复用 _tokenize_zh 切词后做 TF cosine。"""
@@ -648,22 +610,25 @@ class LongTerm:
     def consolidate(self) -> ConsolidationResult:
         """周期性合并：阶段 1 衰减 → 阶段 2 去重/合并 → 阶段 3 双条件淘汰。
 
-        与 main 分支 Go LongTerm.Consolidate 严格对齐：
-          - 衰减按每条 item 自己的 created_at 而非全局 elapsed_days
+        当前语义：
+          - 衰减按每条 item 的 last_decayed_at 增量计算
           - 去重保留 i、删除 j（吸收 importance 取 max 和 tags 合并）
           - 合并产出新 item 替换 i，j 删除
           - 淘汰需同时满足 days > ttl_days 且 importance < min_importance
 
-        本方法只改内存 self.items，不写 PG（持久化由 Task 20 的
-        sync_consolidation_to_db 处理）。返回 ConsolidationResult，
-        delete_from_db 含被去重和合并删除的 j.id；update_in_db 含被替换为
-        merged 后的 i 副本。
+        仓储支持 apply_consolidation 时先事务提交 PG，失败恢复原状态。
+        update_in_db 包含所有最终保留条目（包括仅衰减和去重者）。
+        图投影在 sync_consolidation_to_db 中随后同步，不参与删除决策。
         """
         result = ConsolidationResult()
         with self._lock:
-            if len(self.items) <= 1:
+            if not self.items:
                 return result
 
+            previous_items = self.items
+            previous_count = self._items_since_last
+            previous_ts = self._last_consolidate_ts
+            self.items = [self._copy_item(item) for item in previous_items]
             self._last_consolidate_ts = time.time()
             self._items_since_last = 0
 
@@ -675,10 +640,12 @@ class LongTerm:
 
             now = time.time()
 
-            # 阶段 1：按条目 created_at 单独指数衰减
+            # Apply only the interval not yet decayed, including after restart.
             for item in self.items:
-                days = max(0.0, (now - item.created_at) / 86400.0)
+                since = item.last_decayed_at or item.created_at
+                days = max(0.0, (now - since) / 86400.0)
                 item.importance *= decay_rate ** days
+                item.last_decayed_at = max(since, now)
 
             # 阶段 2：两两比对 dedup + merge
             removed = [False] * len(self.items)
@@ -700,7 +667,7 @@ class LongTerm:
                         # 去重：保留 i，删除 j；i 吸收 j 的 importance 与 tags
                         item_i.importance = max(item_i.importance, item_j.importance)
                         item_i.tags = list(dict.fromkeys(list(item_i.tags) + list(item_j.tags)))
-                        item_i.last_accessed = now
+                        item_i.last_accessed = max(item_i.last_accessed, item_j.last_accessed)
                         removed[j] = True
                         result.deduped += 1
                         if item_j.id is not None:
@@ -729,36 +696,20 @@ class LongTerm:
 
             self.items = [it for k, it in enumerate(self.items) if not removed[k]]
 
-            # 图中心度保护：入度 ≥ threshold 的节点不进入 PG 删除列表（与 main
-            # GraphAwareConsolidate 对齐；只过滤 delete_from_db，不复活内存条目）。
-            if self.graph_memory is not None and result.delete_from_db:
+            # Persist every survivor, including decay-only and dedup metadata.
+            # Graph synchronization is performed only after PG synchronization.
+            result.update_in_db = [self._copy_item(it) for it in self.items]
+            persist = getattr(self.inf.repo.ltm, "apply_consolidation", None)
+            if callable(persist):
                 try:
-                    threshold = int(getattr(self.cfg, "graph_protect_indegree", 3) or 3)
-                    protected = self.graph_memory.filter_protected(
-                        list(result.delete_from_db), threshold
-                    ) or []
-                    if protected:
-                        protected_set = set(protected)
-                        before = len(result.delete_from_db)
-                        result.delete_from_db = [
-                            rid for rid in result.delete_from_db if rid not in protected_set
-                        ]
-                        logger.info(
-                            "🛡️  图中心度保护：%d 条记忆免于 PG 删除（入度≥%d）",
-                            before - len(result.delete_from_db), threshold,
-                        )
-                except Exception as e:
-                    logger.warning("⚠️  graph_memory.filter_protected 失败: %s", e)
-
-            # 图增强记忆 hook：被淘汰 / 被合并删除的条目同步从图删除
-            if self.graph_memory is not None:
-                try:
-                    for rid in result.delete_from_db:
-                        self.graph_memory.delete_from_graph(rid)
-                    for it in self.items:
-                        self.graph_memory.update_node(it)
-                except Exception as e:
-                    logger.warning("⚠️  graph_memory consolidate hook 失败: %s", e)
+                    if not persist(result):
+                        raise RuntimeError("Memory consolidation was not persisted")
+                except Exception:
+                    self.items = previous_items
+                    self._items_since_last = previous_count
+                    self._last_consolidate_ts = previous_ts
+                    raise
+                result.persisted = True
 
         logger.info(
             "✅ 记忆合并完成 deduped=%d merged=%d expired=%d 剩余 %d 条",
@@ -777,7 +728,7 @@ class LongTerm:
     def _merge_pair(self, item_i: Item, item_j: Item, now: float) -> Item:
         """合并 i / j 为一条新 Item（按用户描述：内容用'；'拼接、emb 重要性加权
         平均、importance 取 max、tags dedup 合并、category/slot_hint 取 i 优先、
-        last_accessed=now、created_at 取更早）。返回新 Item，沿用 i 的 id。"""
+        last_accessed 取更晚、created_at 取更早）。返回新 Item，沿用 i 的 id。"""
         # 内容拼接
         content = f"{item_i.content}；{item_j.content}"
 
@@ -813,7 +764,8 @@ class LongTerm:
             embedding=emb,
             id=item_i.id,
             created_at=min(item_i.created_at, item_j.created_at),
-            last_accessed=now,
+            last_accessed=max(item_i.last_accessed, item_j.last_accessed),
+            last_decayed_at=now,
             category=category,
             tags=tags,
             slot_hint=slot_hint,

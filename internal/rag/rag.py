@@ -11,6 +11,7 @@ from internal.graph.types import ChunkRef
 from internal.infra.infra import Infrastructure, RAG_COLLECTION
 from internal.llm.llm import Client as LLMClient
 from internal.promptctx.prompts import RAG_GENERATE_SYSTEM_PROMPT, compose_system_prompt
+from internal.promptctx.context import mark_context_used
 from internal.rag.hybrid import HybridStore
 from internal.rag.rewriter import HistoryMessage
 from internal.rag.splitter import Chunk, RecursiveSplitter
@@ -189,6 +190,7 @@ class Engine:
                 RAG_GENERATE_SYSTEM_PROMPT, context_prefix
             )
             user_msg = f"上下文：\n{context}\n\n问题：{question}"
+            mark_context_used(system_prompt)
             return self._generate_fn(system_prompt, user_msg), fused
 
         return f"【知识库检索结果】\n{context}", fused

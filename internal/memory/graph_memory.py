@@ -63,6 +63,9 @@ class GraphMemory:
         self.neo = neo
         self.llm = llm
         self.sim_thresh = sim_threshold if sim_threshold > 0 else 0.7
+        self._write_lock = threading.RLock()
+        self._deleted_ids = set()
+        self._node_revisions = {}
         self.prev_id: int = -1
         # 可选 LTM 反向引用（与 main 分支 GraphMemory 持有 *LongTerm 对齐）。
         # 持有后：sync_prev_id / set_consolidation_config / need_consolidation
@@ -200,6 +203,8 @@ class GraphMemory:
         if not self._available():
             return -1
         mem_id = self._mem_id(item)
+        with self._write_lock:
+            revision = self._node_revisions.get(mem_id, 0)
         content = getattr(item, "content", "")
         importance = float(getattr(item, "importance", 0.5) or 0.5)
         prev_id = self.prev_id
@@ -220,13 +225,17 @@ class GraphMemory:
                     neighbor_pairs.append((old_id, old_emb, new_emb))
 
         def _write() -> None:
-            self._upsert_memory_node(mem_id, content, importance)
-            if prev_id >= 0 and prev_id != mem_id:
-                self._add_memory_edge(prev_id, mem_id, "FOLLOWS", 1.0)
-            for old_id, old_emb, new_emb in neighbor_pairs:
-                sim = _cosine(old_emb, new_emb)
-                if sim >= self.sim_thresh:
-                    self._add_memory_edge(old_id, mem_id, "SIMILAR_TO", sim)
+            with self._write_lock:
+                if mem_id in self._deleted_ids:
+                    return
+                if revision == self._node_revisions.get(mem_id, 0):
+                    self._upsert_memory_node(mem_id, content, importance)
+                if prev_id >= 0 and prev_id != mem_id:
+                    self._add_memory_edge(prev_id, mem_id, "FOLLOWS", 1.0)
+                for old_id, old_emb, new_emb in neighbor_pairs:
+                    sim = _cosine(old_emb, new_emb)
+                    if sim >= self.sim_thresh:
+                        self._add_memory_edge(old_id, mem_id, "SIMILAR_TO", sim)
 
         _go_safe("graphmem.add-to-graph", _write)
 
@@ -248,9 +257,11 @@ class GraphMemory:
         if not self._available():
             return
         mid = int(item_id)
-        if self.prev_id == mid:
-            self.prev_id = -1
-        self._delete_memory_node(mid)
+        with self._write_lock:
+            self._deleted_ids.add(mid)
+            if self.prev_id == mid:
+                self.prev_id = -1
+            self._delete_memory_node(mid)
 
     def bulk_index(self, items: Iterable) -> int:
         """批量索引：把一批 Item 同步进图（启动期从 LTM 恢复时使用）。
@@ -341,62 +352,19 @@ class GraphMemory:
         """记忆内容/重要性变更后同步更新 Neo4j 节点。"""
         if not self._available():
             return
-        self._upsert_memory_node(
-            self._mem_id(item),
-            getattr(item, "content", ""),
-            float(getattr(item, "importance", 0.5) or 0.5),
-        )
+        mem_id = self._mem_id(item)
+        with self._write_lock:
+            if mem_id in self._deleted_ids:
+                return
+            self._node_revisions[mem_id] = self._node_revisions.get(mem_id, 0) + 1
+            self._upsert_memory_node(
+                mem_id, getattr(item, "content", ""),
+                float(getattr(item, "importance", 0.5)),
+            )
 
     def graph_aware_consolidate(self):
-        """图感知合并：在 LTM.consolidate 基础上保护高中心度节点 + 同步删 Neo4j。
-
-        与 main 分支 GraphMemory.GraphAwareConsolidate 对齐：
-          1) 调 LTM.consolidate 拿基础结果；
-          2) Neo4j 不可用时直接返回基础结果；
-          3) 入度 ≥3 的节点从 delete_from_db 中剔除（保护核心记忆）；
-          4) 异步删除 Neo4j 中对应被删除的节点。
-        """
-        if self.ltm is None:
-            return None
-        try:
-            result = self.ltm.consolidate()
-        except Exception as e:
-            logger.warning("⚠️  graph_aware_consolidate: ltm.consolidate 失败: %s", e)
-            return None
-        if not self._available() or result is None:
-            return result
-
-        delete_ids = list(getattr(result, "delete_from_db", []) or [])
-        if delete_ids:
-            try:
-                protected = set(self._get_high_centrality_ids(delete_ids, 3) or [])
-            except Exception as e:
-                logger.warning("⚠️  graph_aware_consolidate: 高中心度筛选失败: %s", e)
-                protected = set()
-            if protected:
-                filtered = [i for i in delete_ids if i not in protected]
-                logger.info(
-                    "🛡️  图中心度保护：%d 条记忆免于删除（入度≥3）",
-                    len(delete_ids) - len(filtered),
-                )
-                result.delete_from_db = filtered
-                delete_ids = filtered
-
-        if delete_ids:
-            def _delete_async():
-                for nid in delete_ids:
-                    try:
-                        self._delete_memory_node(int(nid))
-                    except Exception as e:
-                        logger.warning("⚠️  Neo4j 节点删除失败 (id=%s): %s", nid, e)
-
-            try:
-                from internal.agent.cancel import go_safe  # 避免循环导入
-                go_safe("graphmem.consolidate-delete", _delete_async)
-            except Exception:
-                _delete_async()
-
-        return result
+        """Use the same deletion set as LTM/PG; graph degree never vetoes it."""
+        return self.ltm.consolidate() if self.ltm is not None else None
 
     def close(self) -> None:
         """语义对齐 Go 版；底层 driver 由 Neo4jClient 拥有，这里仅清状态。"""

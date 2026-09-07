@@ -1,7 +1,6 @@
 """LongTerm.consolidate 的图中心度保护单元测试（Task 14）。
 
-接通 graph_memory.filter_protected：阶段 3 淘汰产生的 delete_from_db 中，
-入度 ≥ threshold 的 id 应被从 PG 删除列表中剔除（内存条目仍被淘汰）。
+图中心度不再否决删除；PG 提交后才同步图，避免重启复活。
 """
 import time
 from types import SimpleNamespace
@@ -61,8 +60,8 @@ def _make_ltm():
     return LongTerm(_Cfg(), inf)
 
 
-def test_filter_protected_removes_from_delete_list():
-    """阶段 3 淘汰命中后，被 graph 保护的 id 不应进 PG 删除列表，但仍从内存移除。"""
+def test_graph_degree_does_not_veto_pg_deletion():
+    """All expired IDs must remain in the deletion set regardless of graph degree."""
     ltm = _make_ltm()
     now = time.time()
     ltm.items = [
@@ -94,15 +93,14 @@ def test_filter_protected_removes_from_delete_list():
     assert result.expired == 2
     assert ltm.items == []
 
-    # PG 删除列表：只剩 902（901 被图保护）
-    assert result.delete_from_db == [902]
+    # PG 删除列表必须包含全部已淘汰条目
+    assert result.delete_from_db == [901, 902]
 
-    # filter_protected 被调用且收到原始候选
-    assert graph.filter_calls
-    assert sorted(graph.filter_calls[0]) == [901, 902]
+    # 中心度不参与删除决策
+    assert graph.filter_calls == []
 
-    # 同步删除图节点：只对未受保护的 902 调用
-    assert graph.deleted == [902]
+    # PG 提交前不触发图删除
+    assert graph.deleted == []  # Graph writes wait for PG commit.
 
 
 def test_no_graph_memory_no_protection():

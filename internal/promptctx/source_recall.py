@@ -73,6 +73,8 @@ class RecallSource(ContextSource):
             category = getattr(h, "category", "") or ""
             slot_hint = getattr(h, "slot_hint", "") or ""
             meta: dict = {}
+            if getattr(h, "id", None) is not None:
+                meta["memory_id"] = str(h.id)
             if category:
                 meta["category"] = category
             if slot_hint:

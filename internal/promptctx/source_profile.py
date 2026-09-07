@@ -83,7 +83,11 @@ class ProfileSource(ContextSource):
                         text=content,
                         score=importance,
                         source=self.id(),
-                        meta={"category": category} if category else {},
+                        meta={
+                            "category": category,
+                            **({"memory_id": str(ltm_item.id)}
+                               if getattr(ltm_item, "id", None) is not None else {}),
+                        },
                     )
                 )
 

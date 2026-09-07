@@ -52,6 +52,7 @@ from internal.promptctx.prompts import (
     compose_system_prompt,
 )
 from internal.rag.rag import Engine as RAGEngine
+from internal.promptctx.context import ContextText, mark_context_used
 from internal.rag.reranker import LLMReranker
 from internal.rag.rewriter import HistoryMessage, LLMRewriter
 from internal.tools.tools import Tool, ToolExecutor, default_tools, new_mcp_tool
@@ -62,7 +63,6 @@ from .init_sandbox import init_sandbox
 from .memory_writer import (
     AsyncMemoryWriter,
     async_update_memory,
-    extract_memory_from_reply,
     maybe_consolidate_memory,
 )
 from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
@@ -581,12 +581,10 @@ class UnifiedAgent:
     # ── finalize ─────────────────────────────────────────────────────────────
 
     def _finalize(self, query: str, resp: Response) -> None:
-        """assistant 写回 + 异步记忆抽取 + 异步图感知合并 + 事件发布 + 计数。"""
+        """assistant 写回 + 异步图感知合并 + 事件发布 + 计数。"""
         self.stm.add("assistant", resp.answer)
         self._save_chat_history("assistant", resp.answer)
 
-        # 异步：从回复中提取事实 → 长期记忆
-        self.memory_writer.submit(lambda: extract_memory_from_reply(self, resp.answer))
         # 异步：长期记忆合并/淘汰（有图层时走图感知合并）
         self.memory_writer.submit(lambda: maybe_consolidate_memory(self))
 
@@ -610,6 +608,7 @@ class UnifiedAgent:
     # ── Memory / Prompt 拼装 ───────────────────────────────────────────────
 
     def _llm_generate(self, system_prompt: str, user_msg: str) -> str:
+        mark_context_used(system_prompt)
         return self.llm.chat([Message(role="user", content=user_msg)], system_prompt=system_prompt)
 
     def _build_prompt_context(self) -> None:
@@ -725,7 +724,17 @@ class UnifiedAgent:
         if trace_sink is not None:
             trace_sink.append(entry)
         _emit(on_event, "context", entry)
-        return rendered
+        used_ids = {
+            int(item.meta["memory_id"])
+            for slot in (context.filled if context is not None else [])
+            if not slot.skipped
+            for item in slot.items
+            if item.text.strip() and "memory_id" in item.meta
+        }
+        def confirm_usage():
+            if used_ids and hasattr(self.ltm, "mark_accessed"):
+                self.ltm.mark_accessed(list(used_ids))
+        return ContextText(rendered, confirm_usage)
 
     def push_task_mem(self, obs: StepObservation) -> None:
         if hasattr(self, "task_mem"):
@@ -799,6 +808,7 @@ class UnifiedAgent:
         return self._chat_llm(system_prompt, hist_msgs, token, on_event)
 
     def _chat_llm(self, system_prompt: str, messages: List[Message], token=None, on_event=None) -> str:
+        mark_context_used(system_prompt)
         if on_event is None:
             return self.llm.chat(messages, system_prompt=system_prompt)
         return self.llm.chat_stream_context(

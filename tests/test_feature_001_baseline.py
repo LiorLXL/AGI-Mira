@@ -302,10 +302,6 @@ class _RawLTMRecorder:
         self.added.append((content, importance))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Feature 001 T201: ordinary user queries must not be copied to LTM",
-)
 def test_future_ordinary_query_is_not_written_to_long_term_memory():
     ltm = _RawLTMRecorder()
     agent = SimpleNamespace(
@@ -344,10 +340,6 @@ class _ClassifiedLTMRecorder:
         return 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Feature 001 T202: assistant output must not activate user memory",
-)
 def test_future_assistant_reply_is_not_a_memory_source():
     preference = _PreferenceRecorder()
     ltm = _ClassifiedLTMRecorder()
@@ -395,10 +387,6 @@ class _StoredRows:
         ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Feature 001 T301: restore must preserve PostgreSQL memory IDs",
-)
 def test_future_restore_preserves_non_contiguous_postgres_ids():
     inf = SimpleNamespace(repo=SimpleNamespace(ltm=_StoredRows()))
     ltm = LongTerm(SimpleNamespace(), inf)

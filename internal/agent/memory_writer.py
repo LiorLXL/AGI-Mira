@@ -1,9 +1,8 @@
-# memory_writer — 异步记忆写入与回复中事实抽取
+# memory_writer — 从用户明确自述中异步提取可信记忆
 #
 # 对应 main 分支 internal/application/chat/mem_writer.go：
-#   - extract_memory_from_reply：从 assistant 回复抽取 k-v 事实，分类后通过
-#     LongTerm.store_classified 入库（含 embed + PG 写 + 图 add_to_graph 一站式），
-#     再调 sync_last_item_pg_id 把 PG 真实主键回写到内存与图。
+#   - assistant 回复不是记忆来源；extract_memory_from_reply 仅保留兼容 no-op。
+#   - 用户明确自述先经安全检查和 key 规范化，再分流 Preference / LTM。
 #   - classify_memory_content：4 条规则 (identity/preference/tool_failure/policy)。
 #   - llm_classify_memory：7 类 6 槽 LLM 兜底。
 #   - sync_consolidation_to_db：把 ConsolidationResult 落到 PG（批删 + 逐条 update）。
@@ -19,9 +18,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from internal.llm.llm import Message
+from internal.memory.preference import normalize_preference_key
 from internal.promptctx.prompts import (
     MEMORY_CLASSIFY_SYSTEM_PROMPT,
-    MEMORY_REPLY_EXTRACT_SYSTEM_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,12 +124,6 @@ _EPHEMERAL_PATTERNS = [
 ]
 
 
-_BIOGRAPHY_KEYS = {
-    "姓名", "名字", "本名", "身份", "职业", "出生年份", "出生日期", "出生地",
-    "出道时间", "首张专辑", "代表作", "代表作品", "奖项", "称号",
-}
-
-
 def _match_any(content: str, patterns) -> MemoryInspection:
     for name, pattern in patterns:
         match = pattern.search(content)
@@ -170,16 +163,6 @@ def inspect_kv_pair(key: str, value: str) -> MemoryInspection:
     return MemoryInspection()
 
 
-def _looks_like_third_party_biography(answer: str, kvs: Dict[str, Any]) -> bool:
-    text = str(answer or "")
-    if not kvs:
-        return False
-    if ("你知道" in text or "他是" in text or "她是" in text or "出生" in text or "代表作" in text) and not re.search(r"(用户|你|您|我)\s*(叫|是|喜欢|出生|来自|在)", text):
-        keys = {str(k) for k in kvs.keys()}
-        return bool(keys & _BIOGRAPHY_KEYS)
-    return False
-
-
 def _strip_code_fence(raw: str) -> str:
     raw = (raw or "").strip()
     raw = re.sub(r"^```json", "", raw)
@@ -202,89 +185,255 @@ def _embed(agent, content: str) -> Optional[List[float]]:
         return None
 
 
-# ── 回复 → 记忆抽取 ────────────────────────────────────────────────────────
+# ── 用户消息 → 可信记忆 ────────────────────────────────────────────────────
 
-def extract_memory_from_reply(agent, answer: str):
-    """从 assistant 回复中提取值得记忆的 k-v 事实并存入长期记忆。
 
-    与 main 分支 mem_writer.go L24-75 对齐：
-      1) LLM 抽 k-v；
-      2) 写偏好仓 (agent.preference.set)；
-      3) classify_memory_content → 失败 fallback llm_classify_memory；
-      4) embed → graph_mem.store_classified（含图 + 内存 + PG 一站式）；
-         若无 graph_mem，回退 ltm.store_classified；
-      5) 调 sync_last_item_pg_id 用 PG 主键校正内存与图节点 ID。
-    """
-    if not answer or not agent.cfg.is_real_llm():
-        return
+@dataclass
+class UserMemoryUpdate:
+    preferences: Dict[str, str]
+    long_term: List[str]
+    rejected: Dict[str, str]
 
-    prompt = f"回复：{answer}"
-    try:
-        raw = agent.llm.chat(
-            [Message(role="user", content=prompt)],
-            system_prompt=MEMORY_REPLY_EXTRACT_SYSTEM_PROMPT,
+
+_EXPLICIT_SELF_PATTERNS = [
+    re.compile(r"(?:^|[，。；,;\s])我(?:叫|是|住在|来自|喜欢|爱|偏好|讨厌|不喜欢|从事|有|通常|经常)"),
+    re.compile(r"我的(?:姓名|名字|城市|居住地|所在地|时区|语言|国家|职业|工作|爱好|兴趣|偏好|回答风格|回复风格)\s*(?:是|为|叫|[:：])"),
+    re.compile(r"请记住我(?:叫|的|喜欢|爱|住在|来自|是)"),
+    re.compile(r"(?:以后)?(?:请)?(?:用|使用).{0,16}(?:回答|回复)"),
+    re.compile(r"我在.{1,30}(?:工作|上班|居住|生活)"),
+]
+
+_QUESTION_HINT = re.compile(r"(?:什么|怎么|如何|哪个|哪里|是否|能否|可以吗|吗|呢)")
+_NON_AUTHORITATIVE_SELF_REFERENCE = re.compile(
+    r"(?:假设|如果|例如|比如|引用|他说|她说|别人说|对方说).{0,24}我"
+)
+_VALUE = r"([^\n,，。！？!?;；]{1,80})"
+
+
+def is_explicit_user_memory_statement(text: str) -> bool:
+    """Return True only for likely first-person stable statements/preferences."""
+    value = str(text or "").strip()
+    if not value or re.search(r"[?？]\s*$", value):
+        return False
+    if _QUESTION_HINT.search(value) and "请记住" not in value:
+        return False
+    if _NON_AUTHORITATIVE_SELF_REFERENCE.search(value):
+        return False
+    return any(pattern.search(value) for pattern in _EXPLICIT_SELF_PATTERNS)
+
+
+def extract_explicit_user_facts(text: str) -> Dict[str, str]:
+    """Fast deterministic extraction for common supported profile keys."""
+    value = str(text or "").strip()
+    if not is_explicit_user_memory_statement(value):
+        return {}
+
+    facts: Dict[str, str] = {}
+    patterns = [
+        (
+            "姓名",
+            re.compile(
+                rf"(?:我叫|我的(?:姓名|名字)(?:是|为|叫)|请记住我的(?:姓名|名字)(?:是|为|叫)){_VALUE}"
+            ),
+        ),
+        (
+            "城市",
+            re.compile(
+                rf"(?:我住在|我的(?:城市|居住地|所在地)(?:是|为)|请记住我的城市(?:是|为)){_VALUE}"
+            ),
+        ),
+        (
+            "时区",
+            re.compile(rf"(?:我的时区(?:是|为)|请记住我的时区(?:是|为)){_VALUE}"),
+        ),
+        (
+            "职业",
+            re.compile(rf"(?:我从事|我的(?:职业|工作|职位)(?:是|为)){_VALUE}"),
+        ),
+        (
+            "国家",
+            re.compile(rf"(?:我的(?:国家|国籍)(?:是|为)){_VALUE}"),
+        ),
+    ]
+    for key, pattern in patterns:
+        match = pattern.search(value)
+        if match:
+            facts[key] = match.group(1).strip()
+
+    language = re.search(
+        r"(?:我的(?:语言|偏好语言|回复语言)(?:是|为)|(?:以后)?(?:请)?(?:用|使用))\s*(中文|英文|英语|日文|日语|法文|法语)",
+        value,
+    )
+    if language:
+        facts["语言"] = language.group(1)
+
+    style = re.search(
+        r"(?:我(?:喜欢|偏好)|以后请|请)(简洁|详细|专业|口语化|分点|直接).{0,8}(?:回答|回复)",
+        value,
+    )
+    if style:
+        facts["回答风格"] = style.group(1)
+
+    like = re.search(rf"我(?:喜欢|爱){_VALUE}", value)
+    if like:
+        liked = like.group(1).strip()
+        if not re.search(r"(?:回答|回复)$", liked):
+            facts["喜好"] = liked
+
+    dislike = re.search(rf"我(?:不喜欢|讨厌){_VALUE}", value)
+    if dislike:
+        facts["禁忌"] = dislike.group(1).strip()
+
+    return facts
+
+
+def extract_memory_from_user(agent, user_input: str) -> UserMemoryUpdate:
+    """Extract, validate and persist memory from one authoritative user turn."""
+    update = UserMemoryUpdate(preferences={}, long_term=[], rejected={})
+    text = str(user_input or "").strip()
+    if not is_explicit_user_memory_statement(text):
+        update.rejected["message"] = "not_explicit_self_statement"
+        return update
+
+    inspection = inspect_memory_content(text)
+    if not inspection.safe:
+        update.rejected["message"] = inspection.risk
+        _publish_event(
+            agent,
+            "memory.user.rejected",
+            {"reason": inspection.reason, "risk": inspection.risk},
         )
-    except Exception as e:
-        logger.warning("⚠️  记忆抽取 LLM 调用失败: %s", e)
-        return
+        return update
 
-    raw = _strip_code_fence(raw)
-    try:
-        kvs = json.loads(raw)
-    except Exception:
-        return
-    if not isinstance(kvs, dict) or not kvs:
-        return
-    if _looks_like_third_party_biography(answer, kvs):
-        logger.info("🛡️  跳过疑似第三方百科记忆抽取，避免写入用户画像")
-        return
-
-    for k, v in kvs.items():
-        if not k or v in (None, ""):
-            continue
-        inspection = inspect_kv_pair(str(k), str(v))
-        if not inspection.safe:
-            logger.info(
-                "🛡️  跳过不安全记忆候选 risk=%s reason=%s matched=%s",
-                inspection.risk,
-                inspection.reason,
-                inspection.matched,
-            )
-            continue
+    candidates = extract_explicit_user_facts(text)
+    extractor = getattr(getattr(agent, "llm", None), "extract_preferences", None)
+    if callable(extractor):
         try:
-            agent.preference.set(str(k), str(v))
-        except Exception:
-            pass
+            extracted = extractor(text) or {}
+        except Exception as e:
+            logger.warning("用户记忆抽取失败: %s", e)
+            extracted = {}
+        if isinstance(extracted, dict):
+            for key, value in extracted.items():
+                candidates.setdefault(str(key), value)
 
-        content = f"用户{k}: {v}"
-        inspection = inspect_memory_content(content)
+    _persist_user_candidates(agent, candidates, update, evidence_text=text)
+    return update
+
+
+def _persist_user_candidates(
+    agent,
+    candidates: Dict[str, Any],
+    update: UserMemoryUpdate,
+    evidence_text: str = "",
+) -> None:
+    for raw_key in sorted(candidates, key=lambda item: str(item)):
+        key = str(raw_key or "").strip()
+        value = _candidate_value(candidates[raw_key])
+        if not key or value is None:
+            continue
+
+        if evidence_text and value.lower() not in evidence_text.lower():
+            update.rejected[key] = "ungrounded_candidate"
+            continue
+
+        inspection = inspect_kv_pair(key, value)
         if not inspection.safe:
-            logger.info(
-                "🛡️  跳过不安全记忆内容 risk=%s reason=%s matched=%s",
-                inspection.risk,
-                inspection.reason,
-                inspection.matched,
+            update.rejected[key] = inspection.risk
+            _publish_event(
+                agent,
+                "memory.user.rejected",
+                {"key": key, "reason": inspection.reason, "risk": inspection.risk},
             )
             continue
-        category, tags, slot_hint = classify_memory_content(str(k), str(v))
-        if not category:
-            category, tags, slot_hint = llm_classify_memory(agent, content)
 
-        emb = _embed(agent, content)
-        importance = 0.7
+        canonical_key = normalize_preference_key(key)
+        if canonical_key:
+            if _set_preference_if_changed(agent, canonical_key, value):
+                update.preferences[canonical_key] = value
+                _publish_event(
+                    agent,
+                    "memory.preference.saved",
+                    {"key": canonical_key, "source": "user"},
+                )
+            continue
 
+        content = f"用户{key}: {value}"
+        content_inspection = inspect_memory_content(content)
+        if not content_inspection.safe:
+            update.rejected[key] = content_inspection.risk
+            continue
+
+        if any(
+            marker in key.lower()
+            for marker in ("规则", "指令", "prompt", "system", "工具结果", "tool_result")
+        ):
+            update.rejected[key] = "unsupported_or_untrusted_category"
+            continue
+        # Supported profile categories were handled above. Any remaining
+        # first-person, safety-checked attribute is a classified user fact.
+        category = "fact"
+        stable_tags = ["source:user", f"memory-key:{key}"]
         try:
             inserted = _store_classified_with_graph(
-                agent, content, importance, emb, category, tags, slot_hint
+                agent,
+                content,
+                0.7,
+                _embed(agent, content),
+                category,
+                stable_tags,
+                "recall_memory",
             )
         except Exception as e:
-            logger.warning("⚠️  长期记忆写入失败: %s", e)
-            inserted = False
+            logger.warning("用户长期记忆写入失败: %s", e)
+            update.rejected[key] = "store_failed"
+            continue
+        if inserted:
+            update.long_term.append(content)
+            _publish_event(
+                agent,
+                "memory.longterm.user_saved",
+                {"category": category, "source": "user"},
+            )
 
-        logger.info(
-            "🧠 从回复中提取记忆：%s = %s（类别=%s，新增=%s）",
-            k, v, category, inserted,
-        )
+
+def _set_preference_if_changed(agent, key: str, value: str) -> bool:
+    preference = getattr(agent, "preference", None)
+    if preference is None:
+        return False
+    getter = getattr(preference, "get", None)
+    if callable(getter):
+        try:
+            if str(getter(key, "")) == value:
+                return False
+        except Exception:
+            pass
+    setter = getattr(preference, "set", None)
+    if not callable(setter):
+        return False
+    setter(key, value)
+    return True
+
+
+def _candidate_value(value: Any) -> Optional[str]:
+    if isinstance(value, (str, int, float, bool)):
+        normalized = str(value).strip()
+    elif isinstance(value, list) and all(
+        isinstance(item, (str, int, float, bool)) for item in value
+    ):
+        normalized = "、".join(str(item).strip() for item in value if str(item).strip())
+    else:
+        return None
+    if not normalized or len(normalized) > 200:
+        return None
+    return normalized
+
+
+# ── Assistant compatibility boundary ───────────────────────────────────────
+
+def extract_memory_from_reply(agent, answer: str):
+    """Deprecated no-op: assistant output is never an authoritative memory source."""
+    return None
 
 
 def _store_classified_with_graph(
@@ -296,31 +445,11 @@ def _store_classified_with_graph(
     tags: List[str],
     slot_hint: str,
 ) -> bool:
-    """统一走 LongTerm.store_classified 路径；命中 dedup 时返回 False。
-
-    LongTerm.store_classified 内部已串起 [内存写 → PG save (RETURNING id) →
-    graph_mem.add_to_graph] 三件事，store_classified 命中 dedup 时返回 False。
-    新增成功后调 graph_mem.sync_last_item_pg_id（如挂载）让图侧 prev_id 与
-    PG 主键保持一致。
-    """
-    ltm = agent.ltm
-    inserted = ltm.store_classified(
-        content,
-        importance,
-        emb,
-        category or "general",
-        list(tags or []),
-        slot_hint or "",
+    """LongTerm assigns the PG ID before graph publication; no last-item rewrite."""
+    return agent.ltm.store_classified(
+        content, importance, emb, category or "general",
+        list(tags or []), slot_hint or "",
     )
-    if inserted:
-        gm = getattr(agent, "graph_memory", None) or getattr(ltm, "graph_memory", None)
-        last_id = ltm.last_id() if hasattr(ltm, "last_id") else -1
-        if gm is not None and last_id > 0 and hasattr(gm, "sync_last_item_pg_id"):
-            try:
-                gm.sync_last_item_pg_id(last_id)
-            except Exception as e:
-                logger.warning("⚠️  graph_mem.sync_last_item_pg_id 失败: %s", e)
-    return inserted
 
 
 def classify_memory_content(key: str, value: str) -> Tuple[str, List[str], str]:
@@ -368,21 +497,26 @@ def llm_classify_memory(agent, content: str) -> Tuple[str, List[str], str]:
 # ── consolidate 后落库 ─────────────────────────────────────────────────────
 
 
-def sync_consolidation_to_db(agent, result) -> None:
-    """把 ConsolidationResult 同步到 PG（与 main mem_writer.go L126-138 对齐）。
-
-    流程：
-      1) 批量删除 result.delete_from_db；
-      2) 逐条 update result.update_in_db（每条 marshal embedding 后调 repo.ltm.update）。
-
-    错误粗粒度：单步失败仅打 warning，不中断后续步骤、不回滚（与 main 一致）。
-    """
+def sync_consolidation_to_db(agent, result) -> bool:
+    """Confirm PG commit, then synchronize graph projections. Return success."""
     if result is None:
-        return
+        return True
     repo = getattr(getattr(agent, "inf", None), "repo", None) or getattr(agent, "repo", None)
     ltm_repo = getattr(repo, "ltm", None) if repo is not None else None
     if ltm_repo is None:
-        return
+        return False
+
+    apply_result = getattr(ltm_repo, "apply_consolidation", None)
+    if callable(apply_result):
+        if not getattr(result, "persisted", False) and not apply_result(result):
+            return False
+        graph = getattr(agent, "graph_memory", None)
+        if graph is not None:
+            for memory_id in result.delete_from_db:
+                graph.delete_from_graph(memory_id)
+            for item in result.update_in_db:
+                graph.update_node(item)
+        return True
 
     delete_ids = list(getattr(result, "delete_from_db", []) or [])
     if delete_ids:
@@ -409,43 +543,38 @@ def sync_consolidation_to_db(agent, result) -> None:
         except Exception as e:
             logger.warning("⚠️  sync_consolidation_to_db update id=%s 失败: %s", item_id, e)
 
+    return True
 
-# ── ReAct 模式下的同步 + 异步偏好提取（保留原 agent.py 的实现）──────────────
+
+# ── 请求入口：同步常用偏好 + 异步完整抽取 ──────────────────────────────────
 
 def async_update_memory(agent, user_input: str, resp: Any) -> None:
-    """ReAct 入口前的偏好抽取：
+    """Persist safe rule hits now, then run the full user extractor async."""
+    text = str(user_input or "").strip()
+    if not is_explicit_user_memory_statement(text):
+        return
+    inspection = inspect_memory_content(text)
+    if not inspection.safe:
+        _publish_event(
+            agent,
+            "memory.user.rejected",
+            {"reason": inspection.reason, "risk": inspection.risk},
+        )
+        return
 
-      1) 同步：用规则提取，立即填到 resp.extracted_info（用户即时反馈）
-      2) 异步：丢到 memory writer 线程做 LLM 提取 + 长期记忆写入
-    """
-    try:
-        from internal.llm.llm import _extract_rule_based
-    except Exception:
-        _extract_rule_based = None  # type: ignore
+    quick = extract_explicit_user_facts(text)
+    quick_update = UserMemoryUpdate(preferences={}, long_term=[], rejected={})
+    _persist_user_candidates(agent, quick, quick_update, evidence_text=text)
+    if quick_update.preferences and hasattr(resp, "extracted_info"):
+        resp.extracted_info = "已记住：" + ", ".join(
+            f"{key}={value}" for key, value in sorted(quick_update.preferences.items())
+        )
 
-    # 1) 同步规则提取
-    if _extract_rule_based is not None:
-        try:
-            quick = _extract_rule_based(user_input) or {}
-        except Exception:
-            quick = {}
-        if quick:
-            try:
-                agent.preference.save_batch(quick)
-            except Exception:
-                pass
-            if hasattr(resp, "extracted_info"):
-                resp.extracted_info = "已记住：" + ", ".join(f"{k}={v}" for k, v in quick.items())
-
-    # 2) 异步 LLM 提取 + LTM 写入
     def _bg():
         try:
-            extracted = agent.llm.extract_preferences(user_input) if hasattr(agent.llm, "extract_preferences") else {}
-            if extracted:
-                agent.preference.save_batch(extracted)
-            agent.ltm.add(user_input)
+            extract_memory_from_user(agent, text)
         except Exception as e:
-            logger.warning("异步更新记忆失败: %s", e)
+            logger.warning("异步更新用户记忆失败: %s", e)
 
     writer = getattr(agent, "memory_writer", None)
     if writer is not None:
@@ -461,6 +590,11 @@ def maybe_consolidate_memory(agent):
     有 graph_memory 时走 ``graph_aware_consolidate``（保护高中心度节点 + 同步删 Neo4j），
     否则走纯内存 ``ltm.consolidate``。
     """
+    pending = getattr(agent, "_pending_memory_consolidation", None)
+    if pending is not None:
+        if sync_consolidation_to_db(agent, pending):
+            agent._pending_memory_consolidation = None
+        return
     try:
         if not agent.ltm.need_consolidation():
             return
@@ -473,6 +607,8 @@ def maybe_consolidate_memory(agent):
         logger.warning("记忆合并失败: %s", e)
         return
     try:
-        sync_consolidation_to_db(agent, result)
+        agent._pending_memory_consolidation = result
+        if sync_consolidation_to_db(agent, result):
+            agent._pending_memory_consolidation = None
     except Exception as e:
         logger.warning("记忆合并落库失败: %s", e)

@@ -2,6 +2,7 @@
 import json
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -23,6 +24,7 @@ class Row:
     tags: List[str] = field(default_factory=list)
     slot_hint: str = ""
     score: float = 0.0
+    last_decayed_at: float = 0.0
 
 
 def _emb_to_str(embedding_json) -> str:
@@ -64,11 +66,12 @@ class PGRepo:
                 cur.execute(
                     "INSERT INTO long_term_memory "
                     "(content, importance, embedding, created_at, last_accessed, "
-                    " category, tags, slot_hint, score) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id",
+                    " category, tags, slot_hint, score, last_decayed_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s) RETURNING id",
                     (content, importance, emb_param,
                      float(created_at), float(last_accessed),
-                     category or "", json.dumps(list(tags)), slot_hint or "", float(score)),
+                     category or "", json.dumps(list(tags)), slot_hint or "", float(score),
+                     float(created_at)),
                 )
                 row = cur.fetchone()
                 return int(row[0]) if row else -1
@@ -85,7 +88,8 @@ class PGRepo:
                 "SELECT id, content, importance, embedding, "
                 "created_at, last_accessed, "
                 "COALESCE(category, ''), COALESCE(tags, '[]'::jsonb), "
-                "COALESCE(slot_hint, ''), COALESCE(score, 0.0) "
+                "COALESCE(slot_hint, ''), COALESCE(score, 0.0), "
+                "COALESCE(last_decayed_at, created_at) "
                 "FROM long_term_memory ORDER BY id"
             )
         except Exception as e:
@@ -147,6 +151,7 @@ class PGRepo:
                     tags=[str(t) for t in tags],
                     slot_hint=slot_hint or "",
                     score=float(score) if score is not None else 0.0,
+                    last_decayed_at=_to_ts(r[10]),
                 ))
             except Exception:
                 continue
@@ -159,8 +164,7 @@ class PGRepo:
         emb_param = _emb_to_str(embedding_json)
         try:
             self.client.exec(
-                "UPDATE long_term_memory SET content = %s, importance = %s, embedding = %s, "
-                "last_accessed = EXTRACT(EPOCH FROM NOW()) WHERE id = %s",
+                "UPDATE long_term_memory SET content = %s, importance = %s, embedding = %s WHERE id = %s",
                 (content, importance, emb_param, item_id),
             )
         except Exception as e:
@@ -169,19 +173,63 @@ class PGRepo:
     # dedup 命中后只更新 Schema-driven 字段（不动 content/embedding）
     def update_classified(self, item_id: int, importance: float,
                           tags: List[str], category: str,
-                          slot_hint: str, last_accessed: float) -> None:
+                          slot_hint: str, last_accessed: float) -> bool:
         if self.client is None or not self.client.is_real():
-            return
+            return False
         try:
-            self.client.exec(
+            count = self.client.exec(
                 "UPDATE long_term_memory SET importance = %s, tags = %s::jsonb, "
                 "category = %s, slot_hint = %s, last_accessed = %s WHERE id = %s",
                 (float(importance), json.dumps(list(tags or [])),
                  category or "", slot_hint or "",
                  float(last_accessed), item_id),
             )
+            return count == 1
         except Exception as e:
             logger.warning("⚠️  长期记忆 update_classified 失败 (id=%d): %s", item_id, e)
+            return False
+
+    def touch(self, ids: List[int], accessed_at: float) -> bool:
+        if self.client is None or not self.client.is_real():
+            return False
+        if not ids:
+            return True
+        count = self.client.exec(
+            "UPDATE long_term_memory SET last_accessed = GREATEST(last_accessed, %s) "
+            "WHERE id = ANY(%s)", (accessed_at, list(set(ids))),
+        )
+        return count == len(set(ids))
+
+    def apply_consolidation(self, result) -> bool:
+        """Persist survivors and deletions atomically, including the decay clock."""
+        if self.client is None or not self.client.is_real():
+            return False
+        try:
+            # Production adapters supply an exclusive transaction connection;
+            # do not enlist unrelated chat/history writes in this transaction.
+            transaction = getattr(self.client, "transaction", None)
+            connection = transaction() if callable(transaction) else nullcontext(self.client.conn)
+            with connection as conn, conn:
+                with conn.cursor() as cur:
+                    for item in result.update_in_db:
+                        cur.execute(
+                            "UPDATE long_term_memory SET content=%s, importance=%s, "
+                            "embedding=%s, category=%s, tags=%s::jsonb, slot_hint=%s, "
+                            "last_decayed_at=%s, last_accessed=GREATEST(last_accessed,%s) WHERE id=%s",
+                            (item.content, item.importance,
+                             json.dumps(item.embedding) if item.embedding else "null",
+                             item.category, json.dumps(item.tags), item.slot_hint,
+                             item.last_decayed_at, item.last_accessed, item.id),
+                        )
+                        if cur.rowcount != 1:
+                            raise RuntimeError("Consolidation target no longer exists")
+                    if result.delete_from_db:
+                        cur.execute("DELETE FROM long_term_memory WHERE id = ANY(%s)",
+                                    (result.delete_from_db,))
+            return True
+        except Exception as exc:
+            logger.warning("Memory consolidation transaction failed: %s", type(exc).__name__)
+            return False
 
     # 批量删除
     def delete(self, ids: List[int]) -> None:

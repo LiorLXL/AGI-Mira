@@ -10,7 +10,11 @@ import threading
 from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
-from internal.memory.preference import Preference
+from internal.memory.preference import (
+    ALLOWED_PREFERENCE_KEYS,
+    Preference,
+    normalize_preference_key,
+)
 
 
 class _PrefRepo:
@@ -98,6 +102,17 @@ def test_save_batch_persists():
     assert p.get("喜好") == "茶"
     saved_keys = {k for _, k, _ in p._repo_ref.saved}
     assert {"姓名", "喜好"} <= saved_keys
+
+
+def test_preference_key_allowlist_and_alias_normalization():
+    assert {"姓名", "城市", "时区", "语言", "国家", "职业", "喜好", "禁忌", "回答风格"} == set(
+        ALLOWED_PREFERENCE_KEYS
+    )
+    assert normalize_preference_key("名字") == "姓名"
+    assert normalize_preference_key("location_name") == "城市"
+    assert normalize_preference_key("回复语言") == "语言"
+    assert normalize_preference_key("response-style") == "回答风格"
+    assert normalize_preference_key("未知字段") is None
 
 
 def test_concurrent_set_and_get_all_is_safe():

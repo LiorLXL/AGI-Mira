@@ -70,8 +70,8 @@ class _LtmRepo:
 # ─── graph_aware_consolidate ───────────────────────────────────────────────
 
 
-def test_graph_aware_consolidate_protects_high_centrality(monkeypatch):
-    """delete_from_db 中入度 >= 3 的节点被剔除。"""
+def test_graph_aware_consolidate_preserves_all_deletions(monkeypatch):
+    """Graph degree cannot veto the canonical deletion set."""
     ltm = _LtmStub(result=_Result(delete=[1, 2, 3]))
     gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm)
 
@@ -83,7 +83,8 @@ def test_graph_aware_consolidate_protects_high_centrality(monkeypatch):
                         lambda mem_id: deletions.append(mem_id))
 
     res = gm.graph_aware_consolidate()
-    assert res.delete_from_db == [1, 3]
+    assert res.delete_from_db == [1, 2, 3]
+    assert deletions == []  # Graph writes wait for PG commit.
 
 
 def test_graph_aware_consolidate_no_neo4j_passthrough():

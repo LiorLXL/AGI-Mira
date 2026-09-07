@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 
 from internal.graph.task_graph import Node, NodeType
 from internal.llm.llm import Message
+from internal.promptctx.context import mark_context_used
 from internal.promptctx.prompts import (
     REACT_PLAN_SYSTEM_PROMPT,
     REACT_STEPS_PLAN_SYSTEM_PROMPT,
@@ -45,6 +46,7 @@ def llm_plan_steps(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     plan_prompt = f"用户问题：{query}"
 
     try:
+        mark_context_used(planner_base)
         raw = agent.llm.chat(
             [Message(role="user", content=plan_prompt)],
             system_prompt=planner_base,
@@ -111,6 +113,7 @@ def llm_plan_graph(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     )
     plan_prompt = f"用户问题：{query}"
     try:
+        mark_context_used(planner_base)
         raw = agent.llm.chat([Message(role="user", content=plan_prompt)], system_prompt=planner_base)
         data = json.loads(_clean_json(raw))
     except Exception as e:

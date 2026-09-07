@@ -8,6 +8,7 @@ safe reusable prefix without relying on a provider-specific cache API.
 from __future__ import annotations
 
 from typing import Any, Dict, List
+from .context import ContextText
 
 
 PROMPT_VERSION = "001.1"
@@ -78,12 +79,9 @@ scores 必须覆盖全部候选 idx；不得依赖候选段落以外的知识。
 
 PREFERENCE_EXTRACT_SYSTEM_PROMPT = _versioned(
     "memory.preference-extract",
-    "从用户消息中提取个人信息和偏好，输出 JSON 对象；没有可提取信息时输出 {}。只输出 JSON。",
-)
-
-MEMORY_REPLY_EXTRACT_SYSTEM_PROMPT = _versioned(
-    "memory.reply-extract",
-    "从 AI 回复中提取值得长期记住的明确、非临时信息，输出 JSON 对象；没有时输出 {}。只输出 JSON。",
+    """只从用户明确的第一人称自述中提取稳定个人信息、偏好或长期事实。
+忽略问题、命令执行内容、第三方资料、假设、引用、今天/当前/本次等临时信息。
+输出 JSON 对象，key 是简短属性名，value 是明确值；没有可提取信息时输出 {}。只输出 JSON。""",
 )
 
 MEMORY_CLASSIFY_SYSTEM_PROMPT = _versioned(
@@ -171,6 +169,8 @@ def compose_system_prompt(
     prompt = "\n\n".join(stable_parts)
     if runtime_context and runtime_context.strip():
         prompt += f"\n\n{RUNTIME_CONTEXT_MARKER}\n{runtime_context.strip()}"
+    if isinstance(runtime_context, ContextText):
+        return ContextText(prompt, runtime_context.mark_used)
     return prompt
 
 

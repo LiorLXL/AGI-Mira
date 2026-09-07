@@ -4,7 +4,7 @@
   1. top_k=2 + emb 充足 → 返回按 score desc 排序后的 2 条
   2. categories 过滤 + require_tags 过滤命中
   3. max_age_hours 过滤掉超龄条目
-  4. query_embedding=None 走 TF fallback；命中时 last_accessed 被回写
+  4. query_embedding=None 走 TF fallback；召回不更新 last_accessed
 """
 import math
 import time
@@ -156,8 +156,8 @@ def test_recall_by_filter_max_age_hours_excludes_stale():
     assert hits[0].id == 20
 
 
-def test_recall_by_filter_tf_fallback_writes_last_accessed():
-    """query_embedding=None 走 TF fallback；命中时回写 last_accessed=now。"""
+def test_recall_by_filter_tf_fallback_is_read_only():
+    """query_embedding=None 走 TF fallback；召回保持 last_accessed 不变。"""
     ltm = _make_ltm()
     now = time.time()
     old_ts = now - 7200.0
@@ -186,9 +186,9 @@ def test_recall_by_filter_tf_fallback_writes_last_accessed():
 
     # 至少命中第一条；第二条由于完全无重叠 token，sim≈0 → 被阈值过滤
     assert any(h.id == 30 for h in hits)
-    # 命中条目的内存中原始 item 的 last_accessed 应被回写到 now
+    # 命中候选尚未进入最终 Prompt，访问时间不变
     target = next(it for it in ltm.items if it.id == 30)
-    assert before <= target.last_accessed <= after
+    assert target.last_accessed == old_ts
     # 未命中的条目 last_accessed 应保持原值
     miss = next(it for it in ltm.items if it.id == 31)
     assert math.isclose(miss.last_accessed, old_ts, rel_tol=0, abs_tol=1e-3)

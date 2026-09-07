@@ -4,6 +4,7 @@
 # 业务持久化逻辑统一收敛到 internal.repo 包：Infrastructure 仅负责连接生命周期
 # (connect / schema bootstrap / health) 与跨域装配 self.repo 仓储入口。
 import json
+from contextlib import contextmanager
 import logging
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -80,6 +81,15 @@ class _PGAdapter:
 
     def is_real(self) -> bool:
         return self._conn is not None
+
+    @contextmanager
+    def transaction(self):
+        """Use an exclusive connection for multi-statement memory changes."""
+        conn = psycopg2.connect(self._conn.dsn)
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     @property
     def conn(self):
@@ -366,6 +376,8 @@ class Infrastructure:
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags          JSONB NOT NULL DEFAULT '[]'::jsonb",
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint     VARCHAR(64) NOT NULL DEFAULT ''",
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS score         DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS last_decayed_at DOUBLE PRECISION",
+            "UPDATE long_term_memory SET last_decayed_at = EXTRACT(EPOCH FROM NOW()) WHERE last_decayed_at IS NULL",
             "CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)",
             "CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)",
             """CREATE TABLE IF NOT EXISTS rag_chunks (
