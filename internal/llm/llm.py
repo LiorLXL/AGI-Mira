@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 
 from config.config import APIConfig
+from internal.request_context import current_request
 from internal.promptctx.prompts import (
     PREFERENCE_EXTRACT_SYSTEM_PROMPT,
     prompt_identity,
@@ -41,6 +42,8 @@ class PromptCallTrace:
     cached_input_tokens: Optional[int] = None
     fallback: bool = False
     error_type: str = ""
+    request_id: str = ""
+    session_id: str = ""
 
 
 class Client:
@@ -383,11 +386,13 @@ class Client:
             return self._trace_sequence
 
     def prompt_traces_since(self, sequence: int) -> List[Dict[str, Any]]:
+        state = current_request.get()
         with self._trace_lock:
             return [
                 asdict(trace)
                 for trace in self._prompt_traces
                 if trace.sequence > int(sequence or 0)
+                and (state is None or trace.request_id == state.request_id)
             ]
 
     def prompt_traces(self) -> List[Dict[str, Any]]:
@@ -415,6 +420,9 @@ class Client:
             separators=(",", ":"),
         )
         scope = f"{purpose}@{version}"
+        state = current_request.get()
+        if state is not None:
+            scope = f"{state.session_id}:{scope}"
         with self._trace_lock:
             previous = self._previous_prompt.get(scope, "")
             common = _common_prefix_length(previous, serialized) if previous else 0
@@ -431,6 +439,8 @@ class Client:
                 prompt_chars=len(serialized),
                 common_prefix_chars=common,
                 stream=stream,
+                request_id=state.request_id if state is not None else "",
+                session_id=state.session_id if state is not None else "",
             )
             self._prompt_traces.append(trace)
             if len(self._prompt_traces) > 200:

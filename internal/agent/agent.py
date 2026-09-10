@@ -19,6 +19,12 @@ from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
+from uuid import uuid4
+from internal.request_context import (
+    DEFAULT_SESSION_ID, RequestState, current_request, normalize_session_id,
+)
+from internal.memory.sessions import SessionStore
 
 from config.config import APIConfig
 from internal.document.library import DOCUMENT_SOURCE_AGENT, WriteRequest
@@ -94,6 +100,7 @@ class ChatOptions:
     use_rag: bool = False
     selected_tools: Optional[List[str]] = None
     explicit: bool = False
+    session_id: str = DEFAULT_SESSION_ID
 
 
 @dataclass
@@ -112,10 +119,72 @@ class Response:
     interrupted: bool = False
     context_trace: List[dict] = field(default_factory=list)
     prompt_trace: List[dict] = field(default_factory=list)
+    session_id: str = DEFAULT_SESSION_ID
+    request_id: str = ""
 
 
 class UnifiedAgent:
     """统一智能体入口。负责装配各子模块、路由分派与 ReAct 推理循环。"""
+
+    _session_init_lock = threading.Lock()
+
+    def _request_state(self):
+        state = current_request.get()
+        return state if state is not None and state.owner is self else None
+
+    @property
+    def stm(self):
+        state = self._request_state()
+        return state.stm if state else self._default_stm
+
+    @stm.setter
+    def stm(self, value):
+        self._default_stm = value
+
+    @property
+    def task_mem(self):
+        state = self._request_state()
+        return state.task_mem if state else self._default_task_mem
+
+    @task_mem.setter
+    def task_mem(self, value):
+        state = self._request_state()
+        if state:
+            state.task_mem = value
+        else:
+            self._default_task_mem = value
+
+    @property
+    def tool_tracker(self):
+        state = self._request_state()
+        return state.tool_tracker if state else self._default_tool_tracker
+
+    @tool_tracker.setter
+    def tool_tracker(self, value):
+        state = self._request_state()
+        if state:
+            state.tool_tracker = value
+        else:
+            self._default_tool_tracker = value
+
+    def _session_store(self):
+        with self._session_init_lock:
+            if not hasattr(self, "_sessions"):
+                self._sessions = SessionStore(
+                    self._default_stm, getattr(self.cfg, "short_term_max_turns", 5)
+                )
+            return self._sessions
+
+    @property
+    def last_subagent_task(self):
+        state = self._request_state()
+        return state.last_subagent_task if state else None
+
+    @last_subagent_task.setter
+    def last_subagent_task(self, value):
+        state = self._request_state()
+        if state:
+            state.last_subagent_task = value
 
     def __init__(self, cfg: APIConfig, inf: Infrastructure):
         self.cfg = cfg
@@ -250,22 +319,27 @@ class UnifiedAgent:
 
     # ── 对外 API ────────────────────────────────────────────────────────────
 
-    def cancel(self):
+    def cancel(self, session_id=None):
         """触发所有 in-flight 请求的取消。"""
-        self._cancel_registry.cancel_all()
+        if session_id is None:
+            self._cancel_registry.cancel_all()
+        else:
+            self._cancel_registry.cancel_session(normalize_session_id(session_id))
 
     def process(self, query: str) -> Response:
         return self.process_with_options(query, ChatOptions(explicit=False))
 
     def process_with_options(self, query: str, opts: ChatOptions) -> Response:
-        token, unregister = self._cancel_registry.register()
+        token, unregister = self._cancel_registry.register(normalize_session_id(opts.session_id))
         try:
             return self._dispatch(query, opts, token)
         finally:
             unregister()
 
-    def process_stream(self, query: str, opts: ChatOptions, on_event) -> Response:
-        token, unregister = self._cancel_registry.register()
+    def process_stream(self, query: str, opts: ChatOptions, on_event, token=None) -> Response:
+        if token is not None:
+            return self._dispatch(query, opts, token, on_event)
+        token, unregister = self._cancel_registry.register(normalize_session_id(opts.session_id))
         try:
             return self._dispatch(query, opts, token, on_event)
         finally:
@@ -442,10 +516,37 @@ class UnifiedAgent:
     # ── 调度主循环 ─────────────────────────────────────────────────────────
 
     def _dispatch(self, query: str, opts: ChatOptions, token, on_event=None) -> Response:
+        session_id = normalize_session_id(opts.session_id)
+        session = self._session_store().get(session_id)
+        with session.lock:
+            state = RequestState(self, session_id, session.stm, TaskMemBuffer(20), ToolStateTracker(10))
+            binding = current_request.set(state)
+            try:
+                if token.is_cancelled():
+                    response = Response(query=query, interrupted=True, answer="[已中断]",
+                                        session_id=session_id, request_id=state.request_id)
+                    _emit(on_event, "done", _to_jsonable(response))
+                    return response
+                if not session.loaded:
+                    repo = getattr(self, "chat_repo", None)
+                    if repo is not None:
+                        for entry in repo.load(
+                            session.stm.max_turns * 2, session_id=session_id
+                        ):
+                            session.stm.add(entry.role, entry.content)
+                    session.loaded = True
+                return self._dispatch_once(query, opts, token, on_event)
+            finally:
+                current_request.reset(binding)
+
+    def _dispatch_once(self, query: str, opts: ChatOptions, token, on_event=None) -> Response:
         """三段式编排：prepare → dispatch → finalize（与 main runOnce 对齐）。"""
         prompt_trace_start = _prompt_trace_count(self.llm)
         pr = self._prepare(query, opts)
         resp = Response(query=query, mode=pr["mode"])
+        state = self._request_state()
+        if state:
+            resp.session_id, resp.request_id = state.session_id, state.request_id
         resp.extracted_info = pr["extracted"]
         if resp.extracted_info:
             _emit(on_event, "memory", {"extracted_info": resp.extracted_info})
@@ -617,8 +718,11 @@ class UnifiedAgent:
         registry = SourceRegistry()
         registry.register(ProfileSource(self.preference, self.ltm))
         registry.register(PlannerSource(self._planner_snapshot))
-        registry.register(TaskMemSource(self.task_mem))
-        registry.register(ToolStateSource(lambda: self.tool_executor.snapshot(), self.tool_tracker))
+        registry.register(TaskMemSource(SimpleNamespace(snapshot=lambda: self.task_mem.snapshot())))
+        registry.register(ToolStateSource(
+            lambda: self.tool_executor.snapshot(),
+            SimpleNamespace(snapshot=lambda: self.tool_tracker.snapshot()),
+        ))
         registry.register(ConstraintsSource([
             Policy(pattern="rm -rf", reason="禁止破坏性删除命令", level="block"),
             Policy(pattern="sudo", reason="禁止提权命令", level="block"),
@@ -672,6 +776,7 @@ class UnifiedAgent:
                     task_id=task_id,
                     mode=mode,
                     phase=phase,
+                    session_id=self._request_state().session_id if self._request_state() else DEFAULT_SESSION_ID,
                 )
             )
         except Exception as e:
@@ -765,7 +870,11 @@ class UnifiedAgent:
             chat_repo = getattr(getattr(self.inf, "repo", None), "chat_history", None)
         if chat_repo is not None and hasattr(chat_repo, "save"):
             try:
-                chat_repo.save(role, content)
+                state = self._request_state()
+                if state:
+                    chat_repo.save(role, content, session_id=state.session_id)
+                else:
+                    chat_repo.save(role, content)
             except Exception:
                 pass
 
@@ -914,7 +1023,9 @@ class UnifiedAgent:
           _generate_final_answer（对应 Go llmGenerate）合成自然语言回复。
         """
         task = {
-            "task_id": f"task_{int(time.time())}",
+            "task_id": f"task_{uuid4().hex}",
+            "session_id": self._request_state().session_id if self._request_state() else DEFAULT_SESSION_ID,
+            "request_id": self._request_state().request_id if self._request_state() else "",
             "query": query,
             "status": "running",
             "phase": "planning",
@@ -1026,7 +1137,9 @@ class UnifiedAgent:
     def _save_agent_snapshot(self, query: str, resp: Response):
         """每 N 轮把 agent 整体状态序列化到 PG（含路由 mode/计数/偏好）。"""
         snapshot = {
-            "task_id": f"agent_{int(time.time())}",
+            "task_id": f"agent_{resp.request_id or uuid4().hex}",
+            "session_id": resp.session_id,
+            "request_id": resp.request_id,
             "query": query,
             "mode": resp.mode,
             "short_term_count": resp.short_term_count,

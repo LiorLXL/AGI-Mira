@@ -1006,12 +1006,13 @@ let uploadedDocs = JSON.parse(localStorage.getItem('ai_docs') || '[]');
 let libraryDocs = [];
 let currentViewerDocId = null;
 let isLoading = false;
+let activeChatSessionId = null;
 
 // ══════════════════════════════════════════
 //  Session management
 // ══════════════════════════════════════════
 function newSession() {
-  const id = Date.now().toString();
+  const id = crypto.randomUUID ? crypto.randomUUID() : Date.now().toString() + '-' + Math.random().toString(36).slice(2);
   sessions.unshift({ id, title: '新对话', messages: [], ts: Date.now() });
   if (sessions.length > 5) sessions = sessions.slice(0, 5);
   currentId = id;
@@ -1037,8 +1038,8 @@ function curSession() {
   return sessions.find(s => s.id === currentId);
 }
 
-function pushMessage(role, html) {
-  const sess = curSession();
+function pushMessage(role, html, sessionId = currentId) {
+  const sess = sessions.find(s => s.id === sessionId);
   if (!sess) return;
   sess.messages.push({ role, html });
   if (sess.messages.length === 1 && role === 'user') {
@@ -1602,8 +1603,10 @@ function stopChat() {
     window._chatAbortCtrl.abort();
     window._chatAbortCtrl = null;
   }
-  fetch('/api/chat/cancel', { method: 'POST' }).catch(() => {});
-  setLoadingState(false);
+  fetch('/api/chat/cancel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: activeChatSessionId || currentId || 'default' })
+  }).catch(() => {});
 }
 
 function setLoadingState(loading) {
@@ -1641,6 +1644,8 @@ async function send() {
   if (!msg || isLoading) return;
 
   if (!currentId) newSession();
+  const requestSessionId = currentId;
+  activeChatSessionId = requestSessionId;
 
   const userHtml = escHtml(msg);
   appendBubble('user', msg);
@@ -1688,7 +1693,7 @@ async function send() {
   window._chatAbortCtrl = new AbortController();
 
   try {
-    const body = { message: msg, use_rag: ragOn, selected_tools: selectedTools, explicit: true };
+    const body = { message: msg, session_id: requestSessionId, use_rag: ragOn, selected_tools: selectedTools, explicit: true };
 
     const resp = await fetch('/api/chat/stream', {
       method: 'POST',
@@ -1705,9 +1710,11 @@ async function send() {
         body: JSON.stringify(body)
       }).then(r => r.json());
       const replyHtml = buildReply(syncData);
-      const msgEl = appendBubble('ai', replyHtml, true);
-      autoExpandThinking(msgEl, syncData);
-      pushMessage('ai', replyHtml);
+      if (currentId === requestSessionId) {
+        const msgEl = appendBubble('ai', replyHtml, true);
+        autoExpandThinking(msgEl, syncData);
+      }
+      pushMessage('ai', replyHtml, requestSessionId);
       return;
     }
 
@@ -1842,21 +1849,23 @@ async function send() {
     }
 
     const replyHtml = bubble.innerHTML;
-    pushMessage('ai', replyHtml);
+    pushMessage('ai', replyHtml, requestSessionId);
 
   } catch(e) {
     const typing = answerEl.querySelector('.typing');
     if (typing) typing.remove();
     if (e.name === 'AbortError') {
       answerEl.innerHTML = `<div class="answer-text">本次回复已取消</div>`;
-      pushMessage('ai', '本次回复已取消');
+      pushMessage('ai', '本次回复已取消', requestSessionId);
     } else {
       answerEl.innerHTML = `<div class="answer-text">❌ 请求失败，请检查服务是否正常运行。</div>`;
-      pushMessage('ai', '❌ 请求失败');
+      pushMessage('ai', '❌ 请求失败', requestSessionId);
     }
   } finally {
     setLoadingState(false);
     window._chatAbortCtrl = null;
+    activeChatSessionId = null;
+    if (currentId === requestSessionId) switchSession(requestSessionId);
   }
 }
 

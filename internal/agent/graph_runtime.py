@@ -6,6 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 from internal.agent.subagents import SubAgentTask
 from internal.graph.task_graph import NodeStatus, NodeType, TaskGraph
 from internal.promptctx import StepObservation, ToolCallTrace
+from internal.request_context import context_thread
 
 
 @dataclass
@@ -72,7 +73,7 @@ class GraphRuntime:
             threads = []
             for group_name, node_ids in groups:
                 target = self._race_group if group_name and self.cfg.enable_racing else self._execute_group
-                t = threading.Thread(target=target, args=(token, group_name, node_ids), daemon=True)
+                t = context_thread(target=target, args=(token, group_name, node_ids), daemon=True)
                 threads.append(t)
                 t.start()
             for t in threads:
@@ -87,7 +88,7 @@ class GraphRuntime:
     def _execute_group(self, token, _group_name: str, node_ids: List[str]) -> None:
         threads = []
         for node_id in node_ids:
-            t = threading.Thread(target=self._execute_node, args=(token, node_id), daemon=True)
+            t = context_thread(target=self._execute_node, args=(token, node_id), daemon=True)
             threads.append(t)
             t.start()
         for t in threads:
@@ -112,7 +113,7 @@ class GraphRuntime:
 
         threads = []
         for node_id in node_ids:
-            t = threading.Thread(target=runner, args=(node_id,), daemon=True)
+            t = context_thread(target=runner, args=(node_id,), daemon=True)
             threads.append(t)
             t.start()
 

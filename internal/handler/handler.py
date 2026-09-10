@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from internal.request_context import DEFAULT_SESSION_ID
 
 from config.config import APIConfig
 from internal.agent.agent import ChatOptions, Response, UnifiedAgent
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 # ─── 请求 / 响应 模型 ──────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
+    session_id: str = Field(default=DEFAULT_SESSION_ID, min_length=1, max_length=128, pattern=r"\S")
     message: str = Field(..., min_length=1, description="用户输入")
     use_rag: bool = False
     selected_tools: Optional[List[str]] = None
@@ -36,6 +38,10 @@ class MCPParam(BaseModel):
     name: str
     description: str = ""
     required: bool = False
+
+
+class CancelRequest(BaseModel):
+    session_id: str = Field(default=DEFAULT_SESSION_ID, min_length=1, max_length=128, pattern=r"\S")
 
 
 class MCPRegisterRequest(BaseModel):
@@ -58,6 +64,8 @@ class UploadJSONRequest(BaseModel):
 def _response_to_dict(resp: Response) -> Dict[str, Any]:
     return {
         "query": resp.query,
+        "session_id": resp.session_id,
+        "request_id": resp.request_id,
         "answer": resp.answer,
         "mode": resp.mode,
         "steps": [
@@ -195,11 +203,12 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
     async def chat(req: ChatRequest):
         try:
             opts = ChatOptions(
+                session_id=req.session_id,
                 use_rag=req.use_rag,
                 selected_tools=req.selected_tools,
                 explicit=req.explicit,
             )
-            resp = agent.process_with_options(req.message, opts)
+            resp = await asyncio.to_thread(agent.process_with_options, req.message, opts)
             return _response_to_dict(resp)
         except HTTPException:
             raise
@@ -212,6 +221,7 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
         """SSE 流式：handler 只负责输出事件，真实 token 由 agent 内部 LLM 流式回调产生。"""
 
         opts = ChatOptions(
+            session_id=req.session_id,
             use_rag=req.use_rag,
             selected_tools=req.selected_tools,
             explicit=req.explicit,
@@ -219,14 +229,14 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
 
         registry = getattr(agent, "_cancel_registry", None)
         if registry is not None:
-            token, unregister = registry.register()
+            token, unregister = registry.register(req.session_id.strip())
         else:
             token = SimpleNamespace(is_cancelled=lambda: False, cancel=lambda: None)
             unregister = lambda: None
 
         async def _generate():
-            yield _sse("start", {"message": req.message})
             try:
+                yield _sse("start", {"message": req.message, "session_id": opts.session_id})
                 if hasattr(agent, "process_stream"):
                     events = queue.Queue()
                     sentinel = object()
@@ -241,7 +251,10 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
 
                     def _run_process_stream():
                         try:
-                            agent.process_stream(req.message, opts, _on_event)
+                            if isinstance(agent, UnifiedAgent):
+                                agent.process_stream(req.message, opts, _on_event, token=token)
+                            else:
+                                agent.process_stream(req.message, opts, _on_event)
                         except Exception as e:
                             logger.error("流式聊天 process_stream 失败: %s", e)
                             events.put(_sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False}))
@@ -305,6 +318,7 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
                 yield _sse("done", data)
                 yield "data: [DONE]\n\n"
             finally:
+                token.cancel()
                 try:
                     unregister()
                 except Exception:
@@ -313,9 +327,12 @@ def setup_routes(agent: UnifiedAgent, inf: Infrastructure, cfg: APIConfig) -> Fa
         return StreamingResponse(_generate(), media_type="text/event-stream")
 
     @app.post("/api/chat/cancel")
-    async def chat_cancel():
+    async def chat_cancel(req: Optional[CancelRequest] = None):
         try:
-            agent.cancel()
+            if req is None:
+                agent.cancel()
+            else:
+                agent.cancel(session_id=req.session_id)
             return {"ok": True, "message": "已发送取消信号"}
         except Exception as e:
             logger.error("取消失败: %s", e)

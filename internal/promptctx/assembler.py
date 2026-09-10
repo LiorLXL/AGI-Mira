@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any, Dict, List, Optional, Tuple
 
 from .context import RuntimeContext
@@ -101,7 +102,7 @@ class ContextAssembler:
         if slots:
             with ThreadPoolExecutor(max_workers=max(1, len(slots))) as pool:
                 futures = {
-                    pool.submit(self._fill_slot, slot, q): index
+                    pool.submit(copy_context().run, self._fill_slot, slot, q): index
                     for index, slot in enumerate(slots)
                 }
                 for future, index in futures.items():

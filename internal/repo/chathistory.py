@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import List
 
 from internal.platform.postgres import PostgresClient
+from internal.request_context import DEFAULT_SESSION_ID
 
 logger = logging.getLogger(__name__)
 
@@ -24,26 +25,26 @@ class PGRepo:
         self.client = client
 
     # 持久化一条聊天记录
-    def save(self, role: str, content: str) -> None:
+    def save(self, role: str, content: str, session_id: str = DEFAULT_SESSION_ID) -> None:
         if self.client is None or not self.client.is_real():
             return
         try:
             self.client.exec(
-                "INSERT INTO chat_history (role, content) VALUES (%s, %s)",
-                (role, content),
+                "INSERT INTO chat_history (role, content, session_id) VALUES (%s, %s, %s)",
+                (role, content, session_id),
             )
         except Exception as e:
             logger.warning("⚠️  聊天记录保存到 PG 失败: %s", e)
 
     # 加载最近 N 条聊天记录（按时间正序返回）
-    def load(self, limit: int) -> List[Entry]:
+    def load(self, limit: int, session_id: str = DEFAULT_SESSION_ID) -> List[Entry]:
         if self.client is None or not self.client.is_real():
             return []
         try:
             rows = self.client.query(
                 "SELECT role, content, TO_CHAR(created_at, 'HH24:MI:SS') "
-                "FROM chat_history ORDER BY id DESC LIMIT %s",
-                (limit,),
+                "FROM chat_history WHERE session_id = %s ORDER BY id DESC LIMIT %s",
+                (session_id, limit),
             )
         except Exception as e:
             logger.warning("⚠️  加载聊天记录失败: %s", e)

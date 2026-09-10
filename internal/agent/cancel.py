@@ -10,6 +10,7 @@
 import logging
 import threading
 import traceback
+from internal.request_context import current_request, DEFAULT_SESSION_ID
 from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -38,24 +39,27 @@ class CancelRegistry:
     def __init__(self):
         self._lock = threading.Lock()
         self._tokens: Dict[int, CancelToken] = {}
+        self._token_sessions = {}
         self._next_id = 0
-        # 当前正在执行的 task 状态（仅保留一个引用，用于 PlannerSource 读取）
+        # No-request compatibility state; active requests use RequestState.
         self._current_task: Optional[dict] = None
         # 当前任务的步骤快照列表（与 main taskRuntime.snapshots 对齐）。
         # set_task 时清空，append_snapshot 持锁追加，snapshot_list 返回拷贝。
         self._snapshots: List[dict] = []
 
-    def register(self) -> tuple:
+    def register(self, session_id=DEFAULT_SESSION_ID) -> tuple:
         """注册一个新的 CancelToken，返回 (token, unregister)。"""
         token = CancelToken()
         with self._lock:
             self._next_id += 1
             tid = self._next_id
             self._tokens[tid] = token
+            self._token_sessions[tid] = session_id
 
         def _unregister():
             with self._lock:
                 self._tokens.pop(tid, None)
+                self._token_sessions.pop(tid, None)
             token.cancel()  # 幂等
 
         return token, _unregister
@@ -68,12 +72,20 @@ class CancelRegistry:
             t.cancel()
 
     def current_task(self) -> Optional[dict]:
+        state = current_request.get()
+        if state is not None:
+            return state.task
         with self._lock:
             return self._current_task
 
     def set_task(self, task: Optional[dict]):
         """设置当前 task，并清空 snapshots（对应 Go setTask 语义）。"""
         with self._lock:
+            state = current_request.get()
+            if state is not None:
+                state.task = task
+                state.snapshots = []
+                return
             self._current_task = task
             self._snapshots = []
 
@@ -82,12 +94,26 @@ class CancelRegistry:
         if snapshot is None:
             return
         with self._lock:
+            state = current_request.get()
+            if state is not None:
+                state.snapshots.append(snapshot)
+                return
             self._snapshots.append(snapshot)
 
     def snapshot_list(self) -> List[dict]:
         """返回当前任务的快照拷贝（对应 Go snapshotList）。"""
         with self._lock:
+            state = current_request.get()
+            if state is not None:
+                return list(state.snapshots)
             return list(self._snapshots)
+
+    def cancel_session(self, session_id):
+        with self._lock:
+            tokens = [token for tid, token in self._tokens.items()
+                      if self._token_sessions[tid] == session_id]
+        for token in tokens:
+            token.cancel()
 
 
 def go_safe(name: str, fn: Callable[[], None]) -> threading.Thread:

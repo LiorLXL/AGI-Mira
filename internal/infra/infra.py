@@ -357,6 +357,8 @@ class Infrastructure:
                 content    TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
+            "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS session_id TEXT NOT NULL DEFAULT 'default'",
+            "CREATE INDEX IF NOT EXISTS idx_chat_session_id ON chat_history(session_id, id DESC)",
             """CREATE TABLE IF NOT EXISTS long_term_memory (
                 id            SERIAL PRIMARY KEY,
                 content       TEXT NOT NULL,

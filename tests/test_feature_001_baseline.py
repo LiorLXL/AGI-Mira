@@ -269,8 +269,8 @@ def test_cache_friendly_prompt_calls_match_feature_001_golden():
     assert actual == expected
 
 
-def test_current_frontend_sessions_are_ui_only_baseline():
-    """Capture why two visible frontend sessions still share backend STM."""
+def test_frontend_session_id_is_forwarded_to_backend():
+    """The former UI-only session defect is now a positive regression test."""
     frontend = (_PROJECT_ROOT / "frontend" / "index.html").read_text(
         encoding="utf-8"
     )
@@ -285,8 +285,8 @@ def test_current_frontend_sessions_are_ui_only_baseline():
         "class MCPParam", 1
     )[0]
 
-    assert "session_id" not in request_body_line
-    assert "session_id" not in chat_request_block
+    assert "session_id: requestSessionId" in request_body_line
+    assert "session_id" in chat_request_block
 
 
 class _ImmediateWriter:
@@ -397,18 +397,10 @@ def test_future_restore_preserves_non_contiguous_postgres_ids():
     assert ltm.last_id() == 42
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Feature 001 T403: short-term history must be isolated by session",
-)
 def test_future_session_b_history_excludes_session_a_messages():
-    agent = object.__new__(UnifiedAgent)
-    agent.stm = ShortTerm(max_turns=5)
-    agent.stm.add("user", "session-a-private-message")
-    agent.stm.add("assistant", "session-a-answer")
-
-    # The current method has no session argument, so a new frontend session
-    # still receives the singleton Agent's existing short-term history.
-    session_b_history = agent._build_history_messages("session-b-question")
-
-    assert all("session-a" not in message.content for message in session_b_history)
+    from test_prompt_cache_friendly import _agent_shell
+    from internal.agent.agent import ChatOptions
+    agent = _agent_shell()
+    agent.process_with_options("session-a-private-message", ChatOptions(explicit=True, session_id="a"))
+    agent.process_with_options("session-b-question", ChatOptions(explicit=True, session_id="b"))
+    assert all("session-a" not in message.content for message in agent.llm.calls[-1][1])

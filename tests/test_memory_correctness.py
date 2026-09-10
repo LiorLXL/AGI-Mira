@@ -15,6 +15,7 @@ from internal.promptctx import (
 )
 from internal.promptctx.prompts import CHAT_SYSTEM_PROMPT, compose_system_prompt
 from internal.repo.longterm import PGRepo
+from internal.platform.postgres import PostgresClient
 from internal.memory.memory import ConsolidationResult
 
 
@@ -260,16 +261,22 @@ def test_pg_repo_restores_decay_clock():
     assert (row.id, row.last_decayed_at, row.created_at) == (42, 11., 10.)
 
 
-@pytest.mark.parametrize("fail_delete", [False, True])
-def test_pg_consolidation_transaction_commits_or_rolls_back(fail_delete):
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("failure", [None, "delete", "missing_update"])
+def test_pg_consolidation_transaction_commits_or_rolls_back(failure, pooled):
     class Connection:
         def __init__(self):
             self.sql = []
             self.rows = {1: "old", 2: "duplicate"}
             self.rowcount = 1
             self.rolled_back = False
+            self.autocommit = True
+            self.completed = False
 
         def __enter__(self):
+            # Assert the adapter contract, independently of psycopg2 versions
+            # that also support "with conn" transactions in autocommit mode.
+            assert self.autocommit is False
             self.before = deepcopy(self.rows)
             return self
 
@@ -277,6 +284,7 @@ def test_pg_consolidation_transaction_commits_or_rolls_back(fail_delete):
             if error:
                 self.rolled_back = True
                 self.rows = self.before
+            self.completed = True
 
         def cursor(self):
             from contextlib import nullcontext
@@ -285,27 +293,64 @@ def test_pg_consolidation_transaction_commits_or_rolls_back(fail_delete):
         def execute(self, sql, params):
             self.sql.append((sql, params))
             if sql.startswith("UPDATE"):
-                self.rows[params[-1]] = params[0]
+                self.rowcount = int(params[-1] in self.rows)
+                if self.rowcount:
+                    self.rows[params[-1]] = params[0]
             elif sql.startswith("DELETE"):
-                if fail_delete:
+                if failure == "delete":
                     raise OSError("delete failed")
                 for mid in params[0]:
                     self.rows.pop(mid, None)
 
-    from contextlib import nullcontext
     conn = Connection()
-    client = SimpleNamespace(is_real=lambda: True, transaction=lambda: nullcontext(conn))
+    returned = []
+    def putconn(connection):
+        assert connection.completed  # commit/rollback precedes pool release
+        returned.append(connection)
+
+    client = object.__new__(PostgresClient)
+    client._pool = SimpleNamespace(getconn=lambda: conn, putconn=putconn) if pooled else None
+    client._conn = None if pooled else conn
     result = ConsolidationResult(
         delete_from_db=[2], update_in_db=[
             Item(id=1, content="merged", last_decayed_at=123., last_accessed=122.)
         ]
     )
-    assert PGRepo(client).apply_consolidation(result) is (not fail_delete)
-    assert conn.rolled_back is fail_delete
-    assert conn.rows == ({1: "old", 2: "duplicate"} if fail_delete else {1: "merged"})
+    if failure == "missing_update":
+        result.update_in_db.append(Item(id=999, content="missing"))
+    assert PGRepo(client).apply_consolidation(result) is (failure is None)
+    assert conn.rolled_back is (failure is not None)
+    assert conn.rows == ({1: "old", 2: "duplicate"} if failure else {1: "merged"})
+    assert returned == ([conn] if pooled else [])
     sql, params = conn.sql[0]
     assert "last_decayed_at=%s" in sql
     assert params[-3:] == (123., 122., 1)
+    if pooled:
+        borrowed = client._borrow()
+        assert borrowed.autocommit is True  # ordinary operations keep their contract
+        client._release(borrowed)
+
+
+def test_transaction_releases_connection_when_disabling_autocommit_fails():
+    class Connection:
+        @property
+        def autocommit(self):
+            return True
+
+        @autocommit.setter
+        def autocommit(self, enabled):
+            if not enabled:
+                raise RuntimeError("cannot change mode")
+
+    conn = Connection()
+    returned = []
+    client = object.__new__(PostgresClient)
+    client._conn = None
+    client._pool = SimpleNamespace(getconn=lambda: conn, putconn=returned.append)
+    with pytest.raises(RuntimeError, match="cannot change mode"):
+        with client.transaction():
+            pytest.fail("unconfigured connection must not be yielded")
+    assert returned == [conn]
 
 
 def test_failed_pg_sync_never_touches_graph():
