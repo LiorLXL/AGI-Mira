@@ -271,21 +271,19 @@ def test_cache_friendly_prompt_calls_match_feature_001_golden():
 
 def test_frontend_session_id_is_forwarded_to_backend():
     """The former UI-only session defect is now a positive regression test."""
-    frontend = (_PROJECT_ROOT / "frontend" / "index.html").read_text(
+    frontend = (_PROJECT_ROOT / "frontend" / "app.js").read_text(
         encoding="utf-8"
     )
     handler = (_PROJECT_ROOT / "internal" / "handler" / "handler.py").read_text(
         encoding="utf-8"
     )
 
-    request_body_line = next(
-        line for line in frontend.splitlines() if "const body = { message: msg" in line
-    )
     chat_request_block = handler.split("class ChatRequest", 1)[1].split(
         "class MCPParam", 1
     )[0]
 
-    assert "session_id: requestSessionId" in request_body_line
+    assert "session_id: sessionId" in frontend
+    assert "this.transport.cancel(sessionId)" in frontend
     assert "session_id" in chat_request_block
 
 

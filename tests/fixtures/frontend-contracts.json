@@ -1,0 +1,645 @@
+{
+  "meta": {
+    "version": 1,
+    "provenance": "Captured from current setup_routes with a deterministic Agent double; no provider or database calls.",
+    "notes": [
+      "HTTP status, serialization, SSE framing and validation are production handler behavior.",
+      "Agent decisions and fixture content are deterministic examples, not real model output.",
+      "A normal streaming done event has no success field; an exception done may have no session_id/request_id."
+    ]
+  },
+  "cases": {
+    "chat_json": {
+      "status": 200,
+      "body": {
+        "query": "示例问题",
+        "session_id": "session_fixture",
+        "request_id": "request_fixture",
+        "answer": "示例回答",
+        "mode": "chat",
+        "steps": [],
+        "tool_call": null,
+        "search_results": [],
+        "task": null,
+        "extracted_info": "",
+        "short_term_count": 0,
+        "long_term_count": 0,
+        "preferences": {},
+        "interrupted": false,
+        "context_trace": [],
+        "prompt_trace": [],
+        "success": true
+      },
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": false,
+        "selected_tools": [],
+        "explicit": true
+      }
+    },
+    "chat_stream": {
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": false,
+        "selected_tools": [],
+        "explicit": true
+      },
+      "status": 200,
+      "events": [
+        {
+          "event": "start",
+          "data": {
+            "message": "示例问题",
+            "session_id": "session_fixture"
+          }
+        },
+        {
+          "event": "route",
+          "data": {
+            "mode": "chat"
+          }
+        },
+        {
+          "event": "context",
+          "data": {
+            "mode": "chat",
+            "phase": "generate",
+            "prompt_version": "001.1",
+            "prompt_chars": 0,
+            "slots": []
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "示例"
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "回答"
+          }
+        },
+        {
+          "event": "done",
+          "data": {
+            "query": "示例问题",
+            "answer": "示例回答",
+            "mode": "chat",
+            "steps": [],
+            "tool_call": null,
+            "search_results": [],
+            "task": null,
+            "extracted_info": "",
+            "short_term_count": 0,
+            "long_term_count": 0,
+            "preferences": {},
+            "interrupted": false,
+            "context_trace": [],
+            "prompt_trace": [],
+            "session_id": "session_fixture",
+            "request_id": "request_fixture"
+          }
+        }
+      ],
+      "terminal": "[DONE]"
+    },
+    "tool_stream": {
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": false,
+        "selected_tools": [
+          "get_time"
+        ],
+        "explicit": true
+      },
+      "status": 200,
+      "events": [
+        {
+          "event": "start",
+          "data": {
+            "message": "示例问题",
+            "session_id": "session_fixture"
+          }
+        },
+        {
+          "event": "route",
+          "data": {
+            "mode": "tool"
+          }
+        },
+        {
+          "event": "context",
+          "data": {
+            "mode": "tool",
+            "phase": "generate",
+            "prompt_version": "001.1",
+            "prompt_chars": 0,
+            "slots": []
+          }
+        },
+        {
+          "event": "tool_call",
+          "data": {
+            "tool_name": "get_time",
+            "params": {},
+            "tool_result": "10:00",
+            "success": true,
+            "error": ""
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "示例"
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "回答"
+          }
+        },
+        {
+          "event": "done",
+          "data": {
+            "query": "示例问题",
+            "answer": "示例回答",
+            "mode": "tool",
+            "steps": [],
+            "tool_call": {
+              "tool_name": "get_time",
+              "params": {},
+              "tool_result": "10:00",
+              "success": true,
+              "error": ""
+            },
+            "search_results": [],
+            "task": null,
+            "extracted_info": "",
+            "short_term_count": 0,
+            "long_term_count": 0,
+            "preferences": {},
+            "interrupted": false,
+            "context_trace": [],
+            "prompt_trace": [],
+            "session_id": "session_fixture",
+            "request_id": "request_fixture"
+          }
+        }
+      ],
+      "terminal": "[DONE]"
+    },
+    "rag_stream": {
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": true,
+        "selected_tools": [],
+        "explicit": true
+      },
+      "status": 200,
+      "events": [
+        {
+          "event": "start",
+          "data": {
+            "message": "示例问题",
+            "session_id": "session_fixture"
+          }
+        },
+        {
+          "event": "route",
+          "data": {
+            "mode": "rag"
+          }
+        },
+        {
+          "event": "context",
+          "data": {
+            "mode": "rag",
+            "phase": "generate",
+            "prompt_version": "001.1",
+            "prompt_chars": 0,
+            "slots": []
+          }
+        },
+        {
+          "event": "rag_result",
+          "data": {
+            "search_results": [
+              {
+                "content": "Fixture source",
+                "score": 0.72,
+                "source": "fixture.md"
+              }
+            ]
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "示例"
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "回答"
+          }
+        },
+        {
+          "event": "done",
+          "data": {
+            "query": "示例问题",
+            "answer": "示例回答",
+            "mode": "rag",
+            "steps": [],
+            "tool_call": null,
+            "search_results": [
+              {
+                "content": "Fixture source",
+                "score": 0.72,
+                "source": "fixture.md"
+              }
+            ],
+            "task": null,
+            "extracted_info": "",
+            "short_term_count": 0,
+            "long_term_count": 0,
+            "preferences": {},
+            "interrupted": false,
+            "context_trace": [],
+            "prompt_trace": [],
+            "session_id": "session_fixture",
+            "request_id": "request_fixture"
+          }
+        }
+      ],
+      "terminal": "[DONE]"
+    },
+    "react_stream": {
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": false,
+        "selected_tools": [],
+        "explicit": true
+      },
+      "status": 200,
+      "events": [
+        {
+          "event": "start",
+          "data": {
+            "message": "示例问题",
+            "session_id": "session_fixture"
+          }
+        },
+        {
+          "event": "route",
+          "data": {
+            "mode": "react"
+          }
+        },
+        {
+          "event": "context",
+          "data": {
+            "mode": "react",
+            "phase": "generate",
+            "prompt_version": "001.1",
+            "prompt_chars": 0,
+            "slots": []
+          }
+        },
+        {
+          "event": "step",
+          "data": {
+            "type": "Thought",
+            "content": "检查输入",
+            "tool": "",
+            "params": null
+          }
+        },
+        {
+          "event": "step",
+          "data": {
+            "type": "Action",
+            "content": "读取资料",
+            "tool": "read_document",
+            "params": {
+              "id": "doc_fixture"
+            }
+          }
+        },
+        {
+          "event": "step",
+          "data": {
+            "type": "Observation",
+            "content": "已读取 1 份资料",
+            "tool": "",
+            "params": null
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "示例"
+          }
+        },
+        {
+          "event": "token",
+          "data": {
+            "content": "回答"
+          }
+        },
+        {
+          "event": "done",
+          "data": {
+            "query": "示例问题",
+            "answer": "示例回答",
+            "mode": "react",
+            "steps": [
+              {
+                "type": "Thought",
+                "content": "检查输入",
+                "tool": "",
+                "params": null
+              },
+              {
+                "type": "Action",
+                "content": "读取资料",
+                "tool": "read_document",
+                "params": {
+                  "id": "doc_fixture"
+                }
+              },
+              {
+                "type": "Observation",
+                "content": "已读取 1 份资料",
+                "tool": "",
+                "params": null
+              }
+            ],
+            "tool_call": null,
+            "search_results": [],
+            "task": null,
+            "extracted_info": "",
+            "short_term_count": 0,
+            "long_term_count": 0,
+            "preferences": {},
+            "interrupted": false,
+            "context_trace": [],
+            "prompt_trace": [],
+            "session_id": "session_fixture",
+            "request_id": "request_fixture"
+          }
+        }
+      ],
+      "terminal": "[DONE]"
+    },
+    "exception_stream": {
+      "request": {
+        "session_id": "session_fixture",
+        "message": "示例问题",
+        "use_rag": false,
+        "selected_tools": [],
+        "explicit": true
+      },
+      "status": 200,
+      "events": [
+        {
+          "event": "start",
+          "data": {
+            "message": "示例问题",
+            "session_id": "session_fixture"
+          }
+        },
+        {
+          "event": "done",
+          "data": {
+            "answer": "请求失败: fixture failure",
+            "interrupted": false,
+            "success": false
+          }
+        }
+      ],
+      "terminal": "[DONE]"
+    },
+    "cancel_session": {
+      "status": 200,
+      "body": {
+        "ok": true,
+        "message": "已发送取消信号"
+      },
+      "request": {
+        "session_id": "session_fixture"
+      }
+    },
+    "upload_json": {
+      "status": 200,
+      "body": {
+        "filename": "upload.txt",
+        "content_type": "text/plain",
+        "parser": "plain_text",
+        "pages": 0,
+        "text_chars": 14,
+        "needs_ocr": false,
+        "chunk_count": 2,
+        "parent_count": 0,
+        "indexed_count": 2,
+        "chunk_preview": null,
+        "doc_hash": "fixture_hash",
+        "chunks": null,
+        "document": {
+          "id": "doc_fixture",
+          "title": "upload.txt",
+          "doc_type": "upload",
+          "source": "user_upload",
+          "status": "active",
+          "created_by": "user",
+          "created_at": "2026-09-10T01:02:03+00:00",
+          "updated_at": "2026-09-10T01:02:03+00:00",
+          "latest_version": 1,
+          "latest_version_id": "ver_fixture"
+        },
+        "version": {
+          "id": "ver_fixture",
+          "document_id": "doc_fixture",
+          "version": 1,
+          "content_md": "fixture upload",
+          "summary": "Fixture summary",
+          "metadata": {
+            "filename": "upload.txt",
+            "content_type": "text/plain",
+            "parser": "plain_text",
+            "pages": 0,
+            "text_chars": 14
+          },
+          "created_at": "2026-09-10T01:02:03+00:00"
+        },
+        "success": true
+      }
+    },
+    "documents_list": {
+      "status": 200,
+      "body": {
+        "documents": [
+          {
+            "id": "doc_fixture",
+            "title": "Fixture document",
+            "doc_type": "report",
+            "source": "agent_generated",
+            "status": "active",
+            "created_by": "agent",
+            "created_at": "2026-09-10T01:02:03+00:00",
+            "updated_at": "2026-09-10T01:02:03+00:00",
+            "latest_version": 1,
+            "latest_version_id": "ver_fixture",
+            "latest_metadata": {
+              "filename": "fixture.md",
+              "parser": "plain_text",
+              "text_chars": 29
+            },
+            "latest_content_chars": 28,
+            "latest_parser": "plain_text"
+          }
+        ]
+      }
+    },
+    "document_detail": {
+      "status": 200,
+      "body": {
+        "document": {
+          "id": "doc_fixture",
+          "title": "Fixture document",
+          "doc_type": "report",
+          "source": "agent_generated",
+          "status": "active",
+          "created_by": "agent",
+          "created_at": "2026-09-10T01:02:03+00:00",
+          "updated_at": "2026-09-10T01:02:03+00:00",
+          "latest_version": 1,
+          "latest_version_id": "ver_fixture"
+        },
+        "version": {
+          "id": "ver_fixture",
+          "document_id": "doc_fixture",
+          "version": 1,
+          "content_md": "# Fixture\n\nContract content.",
+          "summary": "Fixture summary",
+          "metadata": {
+            "filename": "fixture.md",
+            "parser": "plain_text",
+            "text_chars": 29
+          },
+          "created_at": "2026-09-10T01:02:03+00:00"
+        }
+      }
+    },
+    "document_ingest": {
+      "status": 200,
+      "body": {
+        "chunk_count": 2,
+        "parent_count": 0,
+        "indexed_count": 2,
+        "doc_hash": "fixture_hash",
+        "document_id": "doc_fixture",
+        "version_id": "ver_fixture",
+        "section": "upload"
+      }
+    },
+    "tools_list": {
+      "status": 200,
+      "body": [
+        {
+          "name": "rag_search",
+          "description": "检索知识库",
+          "is_mcp": false,
+          "params": [
+            {
+              "name": "query",
+              "type": "string",
+              "description": "问题"
+            }
+          ]
+        }
+      ]
+    },
+    "mcp_register": {
+      "status": 200,
+      "body": {
+        "success": true,
+        "ok": true
+      }
+    },
+    "status": {
+      "status": 200,
+      "body": {
+        "status": "running",
+        "rag_loaded": true,
+        "rag_mode": "hybrid",
+        "rag_chunks": [],
+        "short_term_count": 2,
+        "long_term_count": 1,
+        "preferences": {
+          "回答风格": "简洁"
+        },
+        "tools_count": 1,
+        "llm_model": "fixture-llm",
+        "embedding_model": "fixture-embedding",
+        "is_mock": true,
+        "infrastructure": {
+          "milvus": "connected",
+          "postgresql": "connected",
+          "elasticsearch": "connected",
+          "kafka": "disconnected"
+        }
+      }
+    },
+    "invalid_session": {
+      "status": 422,
+      "body": {
+        "detail": [
+          {
+            "type": "string_too_short",
+            "loc": [
+              "body",
+              "session_id"
+            ],
+            "msg": "String should have at least 1 character",
+            "input": "",
+            "ctx": {
+              "min_length": 1
+            },
+            "url": "https://errors.pydantic.dev/2.6/v/string_too_short"
+          }
+        ]
+      }
+    },
+    "default_session": {
+      "status": 200,
+      "body": {
+        "query": "legacy",
+        "session_id": "default",
+        "request_id": "request_fixture",
+        "answer": "示例回答",
+        "mode": "chat",
+        "steps": [],
+        "tool_call": null,
+        "search_results": [],
+        "task": null,
+        "extracted_info": "",
+        "short_term_count": 0,
+        "long_term_count": 0,
+        "preferences": {},
+        "interrupted": false,
+        "context_trace": [],
+        "prompt_trace": [],
+        "success": true
+      }
+    }
+  }
+}

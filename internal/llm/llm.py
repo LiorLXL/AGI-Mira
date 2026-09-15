@@ -183,10 +183,14 @@ class Client:
                     pass
                 raise RuntimeError(f"API 返回错误状态 {resp.status_code}, body: {body}")
 
-            for raw in resp.iter_lines(decode_unicode=True):
+            # OpenAI-compatible SSE is UTF-8.  Do not let requests infer the
+            # charset from ``text/event-stream`` headers: when charset is
+            # omitted requests may choose ISO-8859-1 and turn Chinese into
+            # mojibake such as ``ä»Šå¤©`` before it reaches the frontend.
+            for raw in resp.iter_lines(decode_unicode=False):
                 if raw is None:
                     continue
-                line = raw.strip() if isinstance(raw, str) else raw
+                line = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else raw.strip()
                 if not line:
                     continue
                 if not line.startswith("data:"):

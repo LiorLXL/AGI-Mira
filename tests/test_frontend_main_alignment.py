@@ -301,57 +301,58 @@ def test_legacy_rag_query_route_removed_to_match_main_branch():
 
 def test_frontend_contains_local_document_library_ui():
     html = Path("frontend/index.html").read_text(encoding="utf-8")
+    api = Path("frontend/api.js").read_text(encoding="utf-8")
+    app = Path("frontend/app.js").read_text(encoding="utf-8")
 
-    assert "libraryDocList" in html
-    assert "docViewer" in html
-    assert "loadLibraryDocs" in html
-    assert "fetchDocumentJSON('/api/documents')" in html
-    assert "/api/documents/' + encodeURIComponent(id) + '/ingest" in html
-    assert "function escAttr" in html
+    assert "data-document-list" in html
+    assert "data-document-reader" in html
+    assert "data-upload-jobs" in html
+    assert "requestJSON('/api/documents')" in api
+    assert "/ingest`" in api
+    assert "async openDocument(id)" in app
 
 
 def test_frontend_refreshes_library_after_document_tool_events():
-    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    app = Path("frontend/app.js").read_text(encoding="utf-8")
 
-    assert "function maybeRefreshLibraryAfterTool" in html
-    assert "write_document" in html
-    assert "ingest_document" in html
-    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name)" in html
-    assert "maybeRefreshLibraryAfterTool(data.tool || data.tool_name || (data.task && data.task.tool_name))" in html
+    assert "const DOCUMENT_TOOLS = ['write_document', 'ingest_document', 'doc_agent']" in app
+    assert "run.refreshDocuments = true" in app
+    assert "if (run.refreshDocuments) this.loadDocuments({ quiet: true })" in app
 
 
 def test_frontend_restores_upload_list_from_document_library():
-    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    storage = Path("frontend/storage.js").read_text(encoding="utf-8")
+    app = Path("frontend/app.js").read_text(encoding="utf-8")
 
-    assert "localStorage.removeItem('ai_docs')" not in html
-    assert "syncUploadedDocsFromLibrary" in html
-    assert "d.source === 'user_upload'" in html
+    assert "localStorage.removeItem" not in storage
+    assert "export const LEGACY_DOCS_KEY = 'ai_docs'" in storage
+    assert "documentId: string(value.documentId || value.document_id)" in storage
+    assert "this.workspace.documents = items" in app
 
 
 def test_frontend_does_not_show_document_version_as_chunk_count():
-    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    api = Path("frontend/api.js").read_text(encoding="utf-8")
+    ui = Path("frontend/ui.js").read_text(encoding="utf-8")
 
-    assert "chunks: Number(d.latest_version || 0)" not in html
-    assert "indexed: Number(d.latest_version || 0)" not in html
-    assert "d.persisted" in html
-    assert "v${d.version || 0}" in html
+    assert "latestVersion: Number.isFinite(Number(row.latest_version))" in api
+    assert "indexStatus: 'unknown'" in api
+    assert "索引状态" in ui
+    assert "chunk_count" not in ui
 
 
 def test_frontend_overwrites_stale_upload_cache_from_document_library():
-    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    app = Path("frontend/app.js").read_text(encoding="utf-8")
+    ui = Path("frontend/ui.js").read_text(encoding="utf-8")
 
-    assert "const uploadKey" in html
-    assert "const existingKey" in html
-    assert "byKey.set(uploadKey, d)" in html
-    assert "byName.has(d.name)" not in html
+    assert "new Map(this.documents.items.map(document => [document.id" in app
+    assert "document.id === selectedId" in ui
+    assert "byName" not in app
 
 
 def test_frontend_uses_completion_badges_instead_of_interrupted_for_successful_done():
-    html = Path("frontend/index.html").read_text(encoding="utf-8")
+    app = Path("frontend/app.js").read_text(encoding="utf-8")
+    ui = Path("frontend/ui.js").read_text(encoding="utf-8")
 
-    assert "function markStreamCompleted" in html
-    assert "推理完成" in html
-    assert "工具调用完成" in html
-    assert "检索完成" in html
-    assert "本次回复已取消" in html
-    assert "✦ 已中断" not in html
+    assert "response?.interrupted ? 'interrupted' : response?.success === false ? 'failed' : 'completed'" in app
+    assert "interrupted: '已取消'" in ui
+    assert "completed: ''" in ui

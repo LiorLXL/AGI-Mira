@@ -36,7 +36,7 @@ class _FakeStreamResponse:
     def __init__(self, lines: List[str], status_code: int = 200):
         self.status_code = status_code
         self._lines = lines
-        self.text = "\n".join(lines)
+        self.text = "\n".join(line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line for line in lines)
 
     def iter_lines(self, decode_unicode: bool = False):  # noqa: D401
         for ln in self._lines:
@@ -127,6 +127,33 @@ def test_chat_stream_context_parses_openai_sse(monkeypatch):
     assert captured["timeout"] == (10, 120)
     assert captured["auth"] == "Bearer fake-key"
     assert _FakeSession.last is not None and _FakeSession.last.closed is True
+
+
+def test_chat_stream_context_decodes_utf8_even_when_sse_charset_is_missing(monkeypatch):
+    """requests must not apply its ISO-8859-1 text/event-stream fallback."""
+    cfg = _mock_cfg(real=True)
+    client = Client(cfg)
+    expected = "今天深圳市南山区天气晴朗，气温20°C（模拟数据）。"
+    payload = f'data: {{"choices":[{{"delta":{{"content":"{expected}"}}}}]}}'.encode("utf-8")
+    fake_resp = _FakeStreamResponse([payload, b"data: [DONE]"])
+    fake_resp.encoding = "ISO-8859-1"
+
+    monkeypatch.setattr(
+        "internal.llm.llm.requests.Session",
+        lambda: _FakeSession(fake_resp),
+    )
+
+    tokens: List[str] = []
+    full = client.chat_stream_context(
+        ctx=None,
+        system_prompt="",
+        messages=[Message(role="user", content="深圳天气")],
+        on_token=tokens.append,
+    )
+
+    assert full == expected
+    assert tokens == [expected]
+    assert "ä»Šå¤©" not in full
 
 
 def test_chat_stream_context_cancel_closes_session(monkeypatch):

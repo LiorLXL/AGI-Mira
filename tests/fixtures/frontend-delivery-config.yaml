@@ -1,0 +1,29 @@
+llm:
+  api_url: ""
+  api_key: ""
+  model: ""
+embedding:
+  api_url: ""
+  api_key: ""
+  model: ""
+milvus:
+  host: ""
+  port: 19530
+postgres:
+  host: ""
+  port: 5432
+  user: ""
+  password: ""
+  database: ""
+elasticsearch:
+  addresses: []
+kafka:
+  brokers: []
+  topic: ""
+neo4j:
+  enabled: false
+server:
+  port: "8092"
+sandbox:
+  enabled: false
+  backend: mock

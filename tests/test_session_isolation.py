@@ -300,8 +300,8 @@ def test_history_repo_queries_include_session_and_preserve_chronology():
 
 
 def test_frontend_pins_stream_reply_and_cancellation_to_originating_session():
-    source = (Path(__file__).parents[1] / "frontend/index.html").read_text(encoding="utf-8")
-    assert "const requestSessionId = currentId;" in source
-    assert "session_id: requestSessionId" in source
-    assert "pushMessage('ai', replyHtml, requestSessionId)" in source
-    assert "activeChatSessionId || currentId" in source
+    source = (Path(__file__).parents[1] / "frontend/app.js").read_text(encoding="utf-8")
+    assert "this.runs.get(run.sessionId)?.clientRunId !== run.clientRunId" in source
+    assert "session_id: sessionId" in source
+    assert "this.transport.cancel(sessionId)" in source
+    assert "run.assistantMessageId" in source
